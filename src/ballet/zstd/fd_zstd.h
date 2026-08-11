@@ -73,6 +73,14 @@ struct fd_zstd_peek {
 };
 typedef struct fd_zstd_peek fd_zstd_peek_t;
 
+struct fd_zstd_frame {
+  ulong offset;
+  ulong sz;
+  ulong skip;
+};
+typedef struct fd_zstd_frame fd_zstd_frame_t;
+
+
 FD_PROTOTYPES_BEGIN
 
 /* fd_zstd_peek peeks a frame header.  buf points to a fragment
@@ -155,6 +163,8 @@ fd_zstd_dstream_read( fd_zstd_dstream_t *     dstream,
                       ulong *                 opt_errcode );
 
 /* TODO: Migrate compression logic from fd_snapshot_create. to fd_zstd.h */
+
+ulong fd_zstd_find_frame_boundaries(const ulong * buffer, ulong sz, fd_zstd_frame_t* arr, ulong arr_sz);
 
 FD_PROTOTYPES_END
 

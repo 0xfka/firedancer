@@ -3,6 +3,7 @@
 #include "../../util/fd_util.h"
 #include <stdalign.h>
 #include <stddef.h>
+#include "../../util/sanitize/fd_fuzz.h"
 
 #if !FD_HAS_ZSTD
 #error "fd_compress requires Zstandard"
@@ -25,6 +26,38 @@ static uchar const test_zstd_comp_1[] =  /* zstd("ABCD") */
     0x00, 0x41, 0x42, 0x43, 0x44, 0x6e, 0x9c, 0x71,
     0x3f };
 
+FD_IMPORT_BINARY(zstd_test_frame_scan, "multi_frame_hundreds.zst");
+
+static void
+test_frame_scanning( void ) {
+  fd_zstd_frame_t arr[2048];
+  if(FD_UNLIKELY(zstd_test_frame_scan_sz < 9)){
+    FD_LOG_ALERT(("imported test file is not valid"));
+  }
+  ulong frame_cnt = fd_zstd_find_frame_boundaries((const ulong*)zstd_test_frame_scan, zstd_test_frame_scan_sz, arr, 2048);
+  if(FD_UNLIKELY(frame_cnt == 0)){
+    FD_LOG_ALERT(("fail"));
+  }
+  for(ulong i = 0; i < frame_cnt; i++){
+    FD_LOG_NOTICE(("start: %lu size: %lu", arr[i].offset, arr[i].sz));
+    // WIP, just checking things manually
+    /*
+     * NOTICE  08-12 13:36:09.697072 0         test_zstd.c(42): start: 0 size: 1048610
+     NOTICE  08-12 13:36:09.697083 0         test_zstd.c(42): start: 1048610 size: 1048610
+     * ➜  firedancer git:(frame_scan) ✗ hexdump -C -s 1048610 -n 16 multi_frame_hundreds.zst
+     00100022  28 b5 2f fd 04 48 00 00  10 55 e9 d3 eb 43 a9 60  |(./..H...U...C.`|
+     00100032
+     ➜  firedancer git:(frame_scan) ✗ hexdump -C -s 1048606 -n 12 multi_frame_hundreds.zst
+     0010001e  87 aa c8 4c 28 b5 2f fd  04 48 00 00              |...L(./..H..|
+     0010002a
+     ➜  firedancer git:(frame_scan) ✗ hexdump -C -s 2097216 -n 16 multi_frame_hundreds.zst
+     00200040  9a fc fc bd                                       |....|
+     00200044
+     ➜  firedancer git:(frame_scan) ✗
+     */
+  }
+  return;
+  }
 static void
 test_decompress( void ) {
   FD_TEST( fd_zstd_dstream_align()==FD_ZSTD_DSTREAM_ALIGN );
@@ -151,6 +184,7 @@ main( int     argc,
   }
 
   test_decompress();
+  test_frame_scanning();
 
   for( int lvl=0; lvl<20; lvl++ ) {
     FD_LOG_INFO(( "ZSTD_estimateCCtxSize(%d) = %lu", lvl, ZSTD_estimateCCtxSize( lvl ) ));
