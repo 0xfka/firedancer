@@ -163,6 +163,9 @@ typedef struct {
 
   ulong pack_txn_cnt; /* total num transactions packed since startup */
 
+  long  slot_pack_start_ns;  /* wallclock ns production began for leader_slot */
+  ulong slot_bundle_txn_cnt; /* bundled txns scheduled into leader_slot */
+
   /* The maximum number of microblocks that can be packed in this slot.
      Provided by the PoH tile when we become leader.*/
   ulong slot_max_microblocks;
@@ -445,6 +448,11 @@ get_done_packing( fd_pack_ctx_t * ctx, fd_done_packing_t * done_packing, int rea
 #undef DELTA
 
   fd_pack_get_pending_smallest( ctx->pack, done_packing->pending_smallest, done_packing->pending_votes_smallest );
+
+  done_packing->bundle_txn_count = ctx->slot_bundle_txn_cnt;
+  done_packing->pack_start_ns    = ctx->slot_pack_start_ns;
+  done_packing->pack_end_ns      = ctx->approx_wallclock_ns + (long)((double)(fd_tickcount() - ctx->approx_tickcount) / ctx->ticks_per_ns);
+
 }
 
 static inline void
@@ -681,23 +689,6 @@ after_credit( fd_pack_ctx_t *     ctx,
     return;
   }
 
-  /* Am I leader? If not, see about inserting at most one transaction
-     from extra storage.  It's important not to insert too many
-     transactions here, or we won't end up servicing dedup_pack enough.
-     If extra storage is empty or pack is full, do nothing. */
-  if( FD_UNLIKELY( ctx->leader_slot==ULONG_MAX ) ) {
-#if FD_PACK_USE_EXTRA_STORAGE
-    if( FD_UNLIKELY( !extra_txn_deq_empty( ctx->extra_txn_deq ) &&
-         fd_pack_avail_txn_cnt( ctx->pack )<ctx->max_pending_transactions ) ) {
-      *charge_busy = 1;
-
-      int result = insert_from_extra( ctx );
-      if( FD_LIKELY( result>=0 ) ) ctx->last_successful_insert = now;
-    }
-#endif
-    return;
-  }
-
   /* Am I in drain mode?  If so, check if I can exit it */
   if( FD_UNLIKELY( ctx->drain_execle ) ) {
     if( FD_LIKELY( ctx->execle_idle_bitset==fd_ulong_mask_lsb( (int)execle_cnt ) ) ) {
@@ -716,6 +707,23 @@ after_credit( fd_pack_ctx_t *     ctx,
     } else {
       return;
     }
+  }
+
+  /* Am I leader? If not, see about inserting at most one transaction
+     from extra storage.  It's important not to insert too many
+     transactions here, or we won't end up servicing dedup_pack enough.
+     If extra storage is empty or pack is full, do nothing. */
+  if( FD_UNLIKELY( ctx->leader_slot==ULONG_MAX ) ) {
+#if FD_PACK_USE_EXTRA_STORAGE
+    if( FD_UNLIKELY( !extra_txn_deq_empty( ctx->extra_txn_deq ) &&
+         fd_pack_avail_txn_cnt( ctx->pack )<ctx->max_pending_transactions ) ) {
+      *charge_busy = 1;
+
+      int result = insert_from_extra( ctx );
+      if( FD_LIKELY( result>=0 ) ) ctx->last_successful_insert = now;
+    }
+#endif
+    return;
   }
 
   if( FD_UNLIKELY( ctx->pending_reduce_mb_bound ) ) {
@@ -872,6 +880,7 @@ after_credit( fd_pack_ctx_t *     ctx,
       ctx->slot_microblock_cnt += fd_ulong_if( trailer->is_bundle, schedule_cnt, 1UL );
       ctx->pack_idx += fd_uint_if( trailer->is_bundle, (uint)schedule_cnt, 1U );
       ctx->pack_txn_cnt += schedule_cnt;
+      ctx->slot_bundle_txn_cnt += fd_ulong_if( trailer->is_bundle, schedule_cnt, 0UL );
 
       ctx->execle_idle_bitset = fd_ulong_pop_lsb( ctx->execle_idle_bitset );
       ctx->skip_cnt           = (long)schedule_cnt * fd_long_if( ctx->use_consumed_cus, (long)execle_cnt/2L, 1L );
@@ -1124,6 +1133,28 @@ after_frag( fd_pack_ctx_t *     ctx,
         ulong deleted = fd_pack_delete_transaction( ctx->pack, fd_type_pun( ctx->executed_txn_sig ) );
         FD_MCNT_INC( PACK, TXN_ALREADY_EXECUTED, deleted );
       }
+      if( FD_UNLIKELY( sig==REPLAY_SIG_RESET && ctx->leader_slot!=ULONG_MAX ) ) {
+        fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out_mem, ctx->poh_out_chunk );
+        get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_ABANDONED );
+        fd_pack_end_block( ctx->pack );
+        fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers );
+
+        fd_stem_publish( stem, 1UL, fd_disco_execle_sig( ctx->leader_slot, ctx->pack_idx ), ctx->poh_out_chunk, sizeof(fd_done_packing_t), 0UL, 0UL, fd_frag_meta_ts_comp( fd_tickcount() ) );
+        ctx->poh_out_chunk = fd_dcache_compact_next( ctx->poh_out_chunk, sizeof(fd_done_packing_t), ctx->poh_out_chunk0, ctx->poh_out_wmark );
+        ctx->pack_idx++;
+
+        FD_LOG_WARNING(( "consensus reset while packing for slot %lu, ending block early", ctx->leader_slot ));
+        log_end_block_metrics( ctx, now, "reset", done_packing->limits_usage->block_cost );
+        ctx->drain_execle        = 1;
+        ctx->leader_slot         = ULONG_MAX;
+        ctx->slot_microblock_cnt = 0UL;
+        remove_ib( ctx );
+
+        update_metric_state( ctx, now, FD_PACK_METRIC_STATE_LEADER,       0 );
+        update_metric_state( ctx, now, FD_PACK_METRIC_STATE_EXECLES,      0 );
+        update_metric_state( ctx, now, FD_PACK_METRIC_STATE_MICROBLOCKS,  0 );
+        return;
+      }
       if( FD_UNLIKELY( sig!=REPLAY_SIG_BECAME_LEADER ) ) return;
       leader_slot = ctx->_became_leader->slot;
 
@@ -1146,7 +1177,7 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     if( FD_UNLIKELY( ctx->leader_slot!=ULONG_MAX ) ) {
       fd_done_packing_t * done_packing = fd_chunk_to_laddr( ctx->poh_out_mem, ctx->poh_out_chunk );
-      get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_LEADER_SWITCH );
+      get_done_packing( ctx, done_packing, FD_PACK_END_SLOT_REASON_ABANDONED );
       fd_pack_end_block( ctx->pack );
       fd_pack_get_top_writers( ctx->pack, done_packing->limits_usage->top_writers );
 
@@ -1163,6 +1194,9 @@ after_frag( fd_pack_ctx_t *     ctx,
     }
     ctx->leader_slot = leader_slot;
 
+    ctx->slot_pack_start_ns  = now_ns;
+    ctx->slot_bundle_txn_cnt = 0UL;
+
     ulong exp_cnt = fd_pack_expire_before( ctx->pack, fd_ulong_max( ctx->leader_slot, TRANSACTION_LIFETIME_SLOTS )-TRANSACTION_LIFETIME_SLOTS );
     FD_MCNT_INC( PACK, TXN_EXPIRED, exp_cnt );
 
@@ -1173,23 +1207,16 @@ after_frag( fd_pack_ctx_t *     ctx,
 
     ulong base_max_data = ctx->larger_shred_limits_per_block ? LARGER_MAX_DATA_PER_BLOCK : FD_PACK_MAX_DATA_PER_BLOCK;
     if( FD_LIKELY( !ctx->larger_shred_limits_per_block ) ) {
-      /* Compute base_max_data to ensure that we don't overflow
-         slot_max_data_shreds. See FD_SHRED_BATCH_BLOCK_DATA_SZ_MAX in
-         fd_shred_batch.h. Some of the terms are
-         based on the worst-case number of FEC sets in a block, which
-         scales with the slot time reductions:
-         - pad_ohead = per-batch padding (OHEAD_PAD in fd_shred_batch.h)
-         - hdr_ohead = per-batch header (OHEAD_HDR in fd_shred_batch.h)
-         - reg_ohead = only used for the last batch
-                       (OHEAD_REG in fd_shred_batch.h) */
-      ulong fec_set_cnt     = ctx->_became_leader->limits.slot_max_data_shreds/32UL;
-      ulong pad_ohead       = ( fec_set_cnt/2UL )*FD_SHREDDER_CHAINED_FEC_SET_PAYLOAD_SZ;
-      ulong hdr_ohead       = fec_set_cnt*8UL;
-      ulong reg_ohead       = 8192UL;
-      FD_TEST( fec_set_cnt >= 2UL ); /* guard against underflow */
-      ulong fec_data        = ( fec_set_cnt - 2UL )*FD_SHREDDER_CHAINED_FEC_SET_PAYLOAD_SZ;
-      FD_TEST( fec_data    >= pad_ohead+hdr_ohead+reg_ohead );
-      base_max_data         = fec_data - pad_ohead - hdr_ohead - reg_ohead;
+      /* Cap pack's entry bytes at the worst case: how many entry
+         bytes fit in max_shred_idx given our shredding.  We fill a
+         batch until the next microblock would not fit in two FEC
+         sets, then pad out that batch.  Empty ticks are subtracted
+         below. */
+      ulong shreds            = ctx->_became_leader->limits.slot_max_data_shreds;
+      ulong max_microblock_sz = sizeof(fd_entry_batch_header_t) + EFFECTIVE_TXN_PER_MICROBLOCK*FD_TPU_MTU;
+      ulong shred_safe        = fd_shred_batch_pack_data_max( shreds, max_microblock_sz );
+      FD_TEST( shred_safe );
+      base_max_data = shred_safe;
     }
     /* Reserve some space in the block for ticks */
     ctx->slot_max_data        = base_max_data
@@ -1587,7 +1614,7 @@ populate_allowed_fds( fd_topo_t const *      topo,
      D. SCHEDULE_MB. *doesn't* return.
      E. EXHAUST_MICROBLOCKS. Sets ctx->leader_slot=ULONG_MAX. return.
    after_frag:
-   	 F. LEADER_SWITCH. Requires ctx->leader_slot!=ULONG_MAX
+   	 F. ABANDONED. Requires ctx->leader_slot!=ULONG_MAX
 
      It isn't possible to get a burst of 3, but a burst of 2 is possible
      in these situations.

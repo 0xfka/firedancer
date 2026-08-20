@@ -695,12 +695,15 @@ fd_reasm_init( fd_reasm_t *      reasm,
   fec->confirmed       = 0;
   fec->popped          = 0;
   fec->bank_dead       = 0;
+  fec->dead_reported   = 0;
   fec->bank_idx        = null;
   fec->parent_bank_idx = null;
   fec->bank_seq        = null;
+  fec->fec_completed_ts_nanos = 0UL;
   fec->out.next        = null;
   fec->out.prev        = null;
   fec->in_out          = 0;
+  fec->xid_next        = null;
   fec->subtreel.next   = null;
   fec->subtreel.prev   = null;
 
@@ -809,9 +812,11 @@ fd_reasm_insert( fd_reasm_t *      reasm,
   fec->confirmed       = 0;
   fec->popped          = 0;
   fec->bank_dead       = 0;
+  fec->dead_reported   = 0;
   fec->bank_idx        = null;
   fec->parent_bank_idx = null;
   fec->bank_seq        = null;
+  fec->fec_completed_ts_nanos = 0UL;
 
   /* set the out and subtreel pointers to null */
   fec->out.next = null;

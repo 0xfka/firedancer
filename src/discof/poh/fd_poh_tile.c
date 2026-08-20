@@ -1,6 +1,7 @@
 #include "fd_poh.h"
 #include "fd_poh_tile.h"
 #include "../replay/fd_replay_tile.h"
+#include "../../util/pod/fd_pod.h"
 #include "../../disco/tiles.h"
 #include "../../disco/fd_clock_tile.h"
 #include "../../discof/fd_startup.h"
@@ -160,13 +161,15 @@ returnable_frag( fd_poh_tile_t *     ctx,
     FD_LOG_ERR(( "chunk %lu %lu corrupt, not in range [%lu,%lu]", chunk, sz, ctx->in[ in_idx ].chunk0, ctx->in[ in_idx ].wmark ));
 
   /* There's a race condition where we might receive microblocks from
-     execles before we have learned what the leader bank is from replay
+     execles (or pack's done_packing, when pack ends the block on a
+     reset) before we have learned what the leader bank is from replay
      (the become_leader message makes it from replay->pack->execle->poh)
      before it just makes it from replay->poh.  This is rare but
      violates invariants in poh, so we simply do not process any
      transactions for mixin until we have learned what the leader bank
-     is. */
-  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE && !fd_poh_have_leader_bank( ctx->poh ) ) ) return 1;
+     is.  become_leader always precedes the reset on the replay link, so
+     these holds always drain. */
+  if( FD_UNLIKELY( ( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE || ctx->in_kind[ in_idx ]==IN_KIND_PACK ) && !fd_poh_have_leader_bank( ctx->poh ) ) ) return 1;
 
   if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_REPLAY && fd_poh_have_leader_bank( ctx->poh ) ) ) return 1;
   /* If prior leaders skipped, it might happen that replay tells us to
@@ -181,7 +184,7 @@ returnable_frag( fd_poh_tile_t *     ctx,
      It's fine to block pack/execles on hashing here, because they we
      are going to have the wait for the full block to timeout once it
      starts. */
-  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE && fd_poh_hashing_to_leader_slot( ctx->poh ) ) ) return 1;
+  if( FD_UNLIKELY( ( ctx->in_kind[ in_idx ]==IN_KIND_EXECLE || ctx->in_kind[ in_idx ]==IN_KIND_PACK ) && fd_poh_hashing_to_leader_slot( ctx->poh ) ) ) return 1;
   /* If prior leaders skipped, it might happen that replay tells us to
      become leader, but we haven't published the skipped ticks yet.
 
@@ -202,7 +205,7 @@ returnable_frag( fd_poh_tile_t *     ctx,
   switch( ctx->in_kind[ in_idx ] ) {
     case IN_KIND_PACK: {
       fd_done_packing_t const * done_packing = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
-      fd_poh_done_packing( ctx->poh, done_packing->microblocks_in_slot );
+      fd_poh_done_packing( ctx->poh, stem, done_packing );
       break;
     }
     case IN_KIND_REPLAY: {
@@ -222,7 +225,12 @@ returnable_frag( fd_poh_tile_t *     ctx,
       ulong txn_cnt = (sz-sizeof(fd_microblock_trailer_t))/sizeof(fd_txn_p_t);
       fd_txn_p_t const * txns = fd_chunk_to_laddr_const( ctx->in[ in_idx ].mem, chunk );
       fd_microblock_trailer_t const * trailer = fd_type_pun_const( (uchar const*)txns+sz-sizeof(fd_microblock_trailer_t) );
-      fd_poh1_mixin( ctx->poh, stem, target_slot, trailer->hash, txn_cnt, txns );
+
+      fd_leader_txn_timing_rec_t timing = {
+        .dispatched_ticks = trailer->exec_start_ticks,
+        .replayed_ticks   = trailer->exec_end_ticks,
+      };
+      fd_poh1_mixin( ctx->poh, stem, target_slot, trailer->hash, txn_cnt, txns, &timing );
       break;
     }
     default: {
@@ -289,7 +297,11 @@ unprivileged_init( fd_topo_t const *      topo,
   *ctx->shred_out = out1( topo, tile, "poh_shred" );
   *ctx->replay_out = out1( topo, tile, "poh_replay" );
 
-  FD_TEST( fd_poh_join( fd_poh_new( ctx->poh ), ctx->shred_out, ctx->replay_out ) );
+  void * timing_tables = NULL;
+  ulong ldr_tt_obj_id = fd_pod_query_ulong( topo->props, "ldr_tt", ULONG_MAX );
+  if( FD_LIKELY( ldr_tt_obj_id!=ULONG_MAX ) ) timing_tables = fd_topo_obj_laddr( topo, ldr_tt_obj_id );
+
+  FD_TEST( fd_poh_join( fd_poh_new( ctx->poh ), ctx->shred_out, ctx->replay_out, timing_tables ) );
 
   fd_clock_tile_init( ctx->poh->clock );
 

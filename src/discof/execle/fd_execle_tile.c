@@ -54,6 +54,7 @@ struct fd_execle_tile {
 
   ulong rebates_for_slot;
   int enable_rebates;
+  ulong rebate_seed;
   fd_pack_rebate_sum_t rebater[ 1 ];
 
   fd_banks_t * banks;
@@ -250,7 +251,8 @@ handle_microblock( fd_execle_tile_t *  ctx,
                    ulong               sz,
                    ulong               begin_tspub,
                    fd_stem_context_t * stem ) {
-  long const microblock_start_ticks = fd_frag_meta_ts_decomp( begin_tspub, fd_tickcount() );
+  long const exec_start_ticks       = fd_tickcount();
+  long const microblock_start_ticks = fd_frag_meta_ts_decomp( begin_tspub, exec_start_ticks );
 
   uchar * dst = (uchar *)fd_chunk_to_laddr( ctx->out_poh->mem, ctx->out_poh->chunk );
 
@@ -263,8 +265,10 @@ handle_microblock( fd_execle_tile_t *  ctx,
   FD_TEST( bank_slot==slot );
 
   fd_microblock_trailer_t * trailer = (fd_microblock_trailer_t *)( dst + txn_cnt*sizeof(fd_txn_p_t) );
-  trailer->txn_ns_dt = (fd_txn_ns_dt_t){0};
-  trailer->bank_seq  = bank->bank_seq;
+  trailer->txn_ns_dt        = (fd_txn_ns_dt_t){0};
+  trailer->bank_seq         = bank->bank_seq;
+  trailer->exec_start_ticks = exec_start_ticks;
+  trailer->exec_end_ticks   = LONG_MAX;
 
   for( ulong i=0UL; i<txn_cnt; i++ ) {
     fd_txn_p_t *   txn     = (fd_txn_p_t *)( dst + (i*sizeof(fd_txn_p_t)) );
@@ -366,6 +370,7 @@ handle_microblock( fd_execle_tile_t *  ctx,
     trailer->txn_ns_dt.exec_start   = fd_float_if( txn_out->details.exec_start_ticks==LONG_MAX,   trailer->txn_ns_dt.check_start,  (float)fd_long_max( 0L, txn_out->details.exec_start_ticks   - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->txn_ns_dt.commit_start = fd_float_if( txn_out->details.commit_start_ticks==LONG_MAX, trailer->txn_ns_dt.exec_start,   (float)fd_long_max( 0L, txn_out->details.commit_start_ticks - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->txn_ns_dt.commit_end   = fd_float_if( txn_end_ticks==LONG_MAX,                       trailer->txn_ns_dt.commit_start, (float)fd_long_max( 0L, txn_end_ticks                       - microblock_start_ticks ) * ctx->ns_per_tick );
+    trailer->exec_end_ticks         = txn_end_ticks;
 
     if( FD_UNLIKELY( !txn_out->err.is_committable ) ) {
       /* If the transaction failed to fit into the block, we need to
@@ -424,6 +429,9 @@ handle_microblock( fd_execle_tile_t *  ctx,
     if( FD_LIKELY( ctx->enable_rebates ) ) fd_pack_rebate_sum_add_txn( ctx->rebater, txn, &writable_alt, 1UL );
   }
 
+  /* Flush GUI-visible counters before releasing the execle to pack. */
+  metrics_write( ctx );
+
   /* Indicate to pack tile we are done processing the transactions so
      it can pack new microblocks using these accounts. */
   fd_fseq_update( ctx->busy_fseq, seq );
@@ -439,12 +447,6 @@ handle_microblock( fd_execle_tile_t *  ctx,
      there's always extra bytes at the end to stash the trailer. */
   FD_STATIC_ASSERT( MAX_MICROBLOCK_SZ-(MAX_TXN_PER_MICROBLOCK*sizeof(fd_txn_p_t))>=sizeof(fd_microblock_trailer_t), poh_shred_mtu );
   FD_STATIC_ASSERT( MAX_MICROBLOCK_SZ-(MAX_TXN_PER_MICROBLOCK*sizeof(fd_txn_p_t))>=sizeof(fd_microblock_execle_trailer_t), poh_shred_mtu );
-
-  /* We have a race window with the GUI, where if the slot is ending it
-     will snap these metrics to draw the waterfall, but see them outdated
-     because housekeeping hasn't run.  For now just update them here, but
-     PoH should eventually flush the pipeline before ending the slot. */
-  metrics_write( ctx );
 
   ulong execle_sig = fd_disco_execle_sig( slot, ctx->_pack_idx );
 
@@ -463,7 +465,8 @@ handle_bundle( fd_execle_tile_t *  ctx,
                ulong               sz,
                ulong               begin_tspub,
                fd_stem_context_t * stem ) {
-  long const microblock_start_ticks = fd_frag_meta_ts_decomp( begin_tspub, fd_tickcount() );
+  long const bundle_start_ticks     = fd_tickcount();
+  long const microblock_start_ticks = fd_frag_meta_ts_decomp( begin_tspub, bundle_start_ticks );
 
   fd_txn_p_t * txns = (fd_txn_p_t *)fd_chunk_to_laddr( ctx->out_poh->mem, ctx->out_poh->chunk );
 
@@ -633,6 +636,18 @@ handle_bundle( fd_execle_tile_t *  ctx,
 
   if( FD_LIKELY( ctx->enable_rebates ) ) fd_pack_rebate_sum_add_txn( ctx->rebater, txns, writable_alt, txn_cnt );
 
+  for( ulong i=0UL; i<txn_cnt; i++ ) {
+    fd_txn_out_t const * txn_out = &ctx->txn_out[ i ];
+
+    ctx->metrics.txn_load_cum_ticks   += fd_ulong_if( txn_out->details.check_start_ticks==LONG_MAX  || txn_out->details.load_start_ticks==LONG_MAX,   0UL, (ulong)( txn_out->details.check_start_ticks  - txn_out->details.load_start_ticks   ) );
+    ctx->metrics.txn_check_cum_ticks  += fd_ulong_if( txn_out->details.exec_start_ticks==LONG_MAX   || txn_out->details.check_start_ticks==LONG_MAX,  0UL, (ulong)( txn_out->details.exec_start_ticks   - txn_out->details.check_start_ticks  ) );
+    ctx->metrics.txn_exec_cum_ticks   += fd_ulong_if( txn_out->details.commit_start_ticks==LONG_MAX || txn_out->details.exec_start_ticks==LONG_MAX,   0UL, (ulong)( txn_out->details.commit_start_ticks - txn_out->details.exec_start_ticks   ) );
+    ctx->metrics.txn_commit_cum_ticks += fd_ulong_if( txn_end_ticks[ i ]==LONG_MAX                  || txn_out->details.commit_start_ticks==LONG_MAX, 0UL, (ulong)( txn_end_ticks[ i ]                  - txn_out->details.commit_start_ticks ) );
+  }
+
+  /* Flush GUI-visible counters before releasing the execle to pack. */
+  metrics_write( ctx );
+
   /* Indicate to pack tile we are done processing the transactions so
      it can pack new microblocks using these accounts. */
   fd_fseq_update( ctx->busy_fseq, seq );
@@ -653,21 +668,13 @@ handle_bundle( fd_execle_tile_t *  ctx,
 
     fd_microblock_trailer_t * trailer = (fd_microblock_trailer_t *)( dst+sizeof(fd_txn_p_t) );
     hash_transactions( ctx->bmtree, (fd_txn_p_t*)dst, 1UL, trailer->hash );
-    trailer->pack_txn_idx = ctx->_txn_idx + i;
-    trailer->tips         = tips[ i ];
-    trailer->bank_seq     = bank->bank_seq;
+    trailer->pack_txn_idx     = ctx->_txn_idx + i;
+    trailer->tips             = tips[ i ];
+    trailer->bank_seq         = bank->bank_seq;
+    trailer->exec_start_ticks = bundle_start_ticks;
+    trailer->exec_end_ticks   = txn_end_ticks[ i ];
 
     ulong execle_sig = fd_disco_execle_sig( slot, ctx->_pack_idx+i );
-
-    ulong const load_ticks_dt   = fd_ulong_if( txn_out->details.check_start_ticks==LONG_MAX  || txn_out->details.load_start_ticks==LONG_MAX,   0UL, (ulong)( txn_out->details.check_start_ticks  - txn_out->details.load_start_ticks   ) );
-    ulong const check_ticks_dt  = fd_ulong_if( txn_out->details.exec_start_ticks==LONG_MAX   || txn_out->details.check_start_ticks==LONG_MAX,  0UL, (ulong)( txn_out->details.exec_start_ticks   - txn_out->details.check_start_ticks  ) );
-    ulong const exec_ticks_dt   = fd_ulong_if( txn_out->details.commit_start_ticks==LONG_MAX || txn_out->details.exec_start_ticks==LONG_MAX,   0UL, (ulong)( txn_out->details.commit_start_ticks - txn_out->details.exec_start_ticks   ) );
-    ulong const commit_ticks_dt = fd_ulong_if( txn_end_ticks[ i ]==LONG_MAX                  || txn_out->details.commit_start_ticks==LONG_MAX, 0UL, (ulong)( txn_end_ticks[ i ]                  - txn_out->details.commit_start_ticks ) );
-
-    ctx->metrics.txn_load_cum_ticks   += load_ticks_dt;
-    ctx->metrics.txn_check_cum_ticks  += check_ticks_dt;
-    ctx->metrics.txn_exec_cum_ticks   += exec_ticks_dt;
-    ctx->metrics.txn_commit_cum_ticks += commit_ticks_dt;
 
     trailer->txn_ns_dt.load_start   = fd_float_if( txn_out->details.load_start_ticks==LONG_MAX,   0.,                              (float)fd_long_max( 0L, txn_out->details.load_start_ticks   - microblock_start_ticks ) * ctx->ns_per_tick );
     trailer->txn_ns_dt.check_start  = fd_float_if( txn_out->details.check_start_ticks==LONG_MAX,  trailer->txn_ns_dt.load_start,   (float)fd_long_max( 0L, txn_out->details.check_start_ticks  - microblock_start_ticks ) * ctx->ns_per_tick );
@@ -679,8 +686,6 @@ handle_bundle( fd_execle_tile_t *  ctx,
     fd_stem_publish( stem, ctx->out_poh->idx, execle_sig, ctx->out_poh->chunk, new_sz, 0UL, (ulong)fd_frag_meta_ts_comp( microblock_start_ticks ), (ulong)fd_frag_meta_ts_comp( fd_tickcount() ) );
     ctx->out_poh->chunk = fd_dcache_compact_next( ctx->out_poh->chunk, new_sz, ctx->out_poh->chunk0, ctx->out_poh->wmark );
   }
-
-  metrics_write( ctx );
 }
 
 static inline void
@@ -741,6 +746,16 @@ out1( fd_topo_t const *      topo,
 }
 
 static void
+privileged_init( fd_topo_t const *      topo,
+                 fd_topo_tile_t const * tile ) {
+  void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
+
+  FD_SCRATCH_ALLOC_INIT( l, scratch );
+  fd_execle_tile_t * ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_execle_tile_t), sizeof(fd_execle_tile_t) );
+  FD_TEST( fd_rng_secure( &ctx->rebate_seed, sizeof(ctx->rebate_seed) ) );
+}
+
+static void
 unprivileged_init( fd_topo_t const *      topo,
                    fd_topo_tile_t const * tile ) {
   void * scratch = fd_topo_obj_laddr( topo, tile->tile_obj_id );
@@ -762,7 +777,7 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->blake3    = NONNULL( fd_blake3_join( fd_blake3_new( blake3 ) ) );
   ctx->bmtree    = NONNULL( bmtree );
 
-  NONNULL( fd_pack_rebate_sum_join( fd_pack_rebate_sum_new( ctx->rebater ) ) );
+  NONNULL( fd_pack_rebate_sum_join( fd_pack_rebate_sum_new( ctx->rebater, ctx->rebate_seed ) ) );
   ctx->rebates_for_slot  = 0UL;
 
   FD_TEST( fd_progcache_join( ctx->progcache,
@@ -894,6 +909,7 @@ fd_topo_run_tile_t fd_tile_execle = {
   .populate_allowed_fds     = populate_allowed_fds,
   .scratch_align            = scratch_align,
   .scratch_footprint        = scratch_footprint,
+  .privileged_init          = privileged_init,
   .unprivileged_init        = unprivileged_init,
   .run                      = stem_run,
 };

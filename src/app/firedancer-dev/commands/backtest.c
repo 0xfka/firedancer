@@ -31,6 +31,7 @@
 #include "../../../discof/tower/fd_tower_tile.h"
 #include "../../../discof/replay/fd_execrp.h"
 #include "../../../disco/shred/fd_shred_tile.h"
+#include "../../../discof/repair/fd_repair_tile.h"
 #include "../../../flamenco/capture/fd_capture_ctx.h"
 #include "../../../disco/pack/fd_pack_cost.h"
 #include "../../../flamenco/progcache/fd_progcache_admin.h"
@@ -194,7 +195,7 @@ backtest_topo( config_t * config ) {
      batches from the CLI-specified source (eg. pcap/pcapng file). */
 
   fd_topob_wksp( topo, "repair_out" );
-  fd_topob_link( topo, "repair_out", "repair_out", 65536UL, sizeof(fd_fec_complete_t), 1UL );
+  fd_topob_link( topo, "repair_out", "repair_out", 65536UL, sizeof(fd_repair_fec_complete_t), 1UL );
   fd_topob_tile_in( topo, "replay", 0UL, "metric_in", "repair_out", 0UL, FD_TOPOB_RELIABLE, FD_TOPOB_POLLED );
   fd_topob_tile_out( topo, "backt", 0UL, "repair_out", 0UL );
 
@@ -213,8 +214,8 @@ backtest_topo( config_t * config ) {
     fd_topob_wksp( topo, "snapwr_ct" );
 
     fd_topob_link( topo, "snapct_ld",    "snapct_ld",    128UL,   sizeof(fd_ssctrl_init_t),       1UL );
-    fd_topob_link( topo, "snapld_dc",    "snapld_dc",    16384UL, FD_SNAPSHOT_DATA_MTU,           1UL );
-    fd_topob_link( topo, "snapdc_in",    "snapdc_in",    16384UL, FD_SNAPSHOT_DATA_MTU,           1UL );
+    fd_topob_link( topo, "snapld_dc",    "snapld_dc",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
+    fd_topob_link( topo, "snapdc_in",    "snapdc_in",    FD_SNAPSHOT_DATA_DEPTH, FD_SNAPSHOT_DATA_MTU,           1UL );
 
     fd_topob_link( topo, "snapin_manif", "snapin_manif", 4UL,     sizeof(fd_snapshot_manifest_t), 1UL ); /* TODO: Should be depth 1 or 2 but replay backpressures */
     fd_topob_link( topo, "snapct_repr",  "snapct_repr",  128UL,   0UL,                            1UL )->permit_no_consumers = 1;

@@ -68,6 +68,7 @@ void  mock_sched_abandon_fn     ( fd_sched_t * s FD_PARAM_UNUSED, ulong i, int i
   mock_sched_abandon_idx = i;
 }
 void  mock_sched_cancel_fn      ( fd_sched_t * s FD_PARAM_UNUSED, ulong i FD_PARAM_UNUSED ) {}
+int   mock_sched_is_discarded_fn( fd_sched_t * s FD_PARAM_UNUSED, ulong i FD_PARAM_UNUSED ) { return 0; }
 ulong mock_sched_pruned_fn      ( fd_sched_t * s FD_PARAM_UNUSED ) { return ULONG_MAX; }
 void  mock_sched_metrics_fn     ( fd_sched_t * s FD_PARAM_UNUSED ) {}
 void  mock_sched_poh_fn         ( fd_sched_t * s FD_PARAM_UNUSED, ulong a FD_PARAM_UNUSED, ulong b FD_PARAM_UNUSED, ulong c FD_PARAM_UNUSED, ulong d FD_PARAM_UNUSED, fd_hash_t const * e FD_PARAM_UNUSED ) {}
@@ -82,6 +83,7 @@ void  mock_sched_root_notify_fn ( fd_sched_t * s FD_PARAM_UNUSED, ulong i ) {
 #define fd_sched_is_drained        mock_sched_is_drained_fn
 #define fd_sched_block_abandon     mock_sched_abandon_fn
 #define fd_sched_cancel            mock_sched_cancel_fn
+#define fd_sched_block_is_discarded mock_sched_is_discarded_fn
 #define fd_sched_pruned_block_next mock_sched_pruned_fn
 #define fd_sched_metrics_write     mock_sched_metrics_fn
 #define fd_sched_set_poh_params    mock_sched_poh_fn
@@ -178,6 +180,8 @@ mock_runtime_block_execute_prepare_fn( fd_banks_t *         banks FD_PARAM_UNUSE
 
 #include "fd_replay_tile.c"
 
+FD_STATIC_ASSERT( alignof(fd_reasm_fec_t)==128UL, reasm_fec_alignment );
+
 /* ---- Test setup ---- */
 
 static fd_frag_meta_t * test_stem_mcaches[ TEST_OUT_CNT ];
@@ -191,7 +195,7 @@ static fd_stem_context_t test_stem[ 1 ];
 static void
 setup_repair_input( fd_replay_tile_t * ctx, fd_wksp_t * wksp ) {
   ulong const depth = 128UL;
-  ulong const mtu   = sizeof(fd_fec_complete_t);
+  ulong const mtu   = sizeof(fd_repair_fec_complete_t);
   ulong dcache_data_sz = fd_dcache_req_data_sz( mtu, depth, 1UL, 1 );
 
   void * dcache_mem = fd_wksp_alloc_laddr( wksp, fd_dcache_align(), fd_dcache_footprint( dcache_data_sz, 0UL ), 1UL );
@@ -254,11 +258,25 @@ setup_stem( fd_replay_tile_t * ctx, fd_wksp_t * wksp ) {
   };
 }
 
+static ulong test_timing_of_bank[ TEST_BANKS_MAX ];
+
+static void
+setup_timing( fd_replay_tile_t * ctx,
+              fd_wksp_t *        wksp ) {
+  fd_clock_tile_init( ctx->clock );
+  void * mem = fd_wksp_alloc_laddr( wksp, fd_timing_slot_pool_align(), fd_timing_slot_pool_footprint( FD_REPLAY_TXN_TIMING_SLOTS ), 1UL );
+  ctx->timing_slot_pool = fd_timing_slot_pool_join( fd_timing_slot_pool_new( mem, FD_REPLAY_TXN_TIMING_SLOTS ) );
+  FD_TEST( ctx->timing_slot_pool );
+  ctx->timing_slot_of_bank = test_timing_of_bank;
+  for( ulong i=0UL; i<TEST_BANKS_MAX; i++ ) ctx->timing_slot_of_bank[ i ] = fd_timing_slot_pool_idx_null( ctx->timing_slot_pool );
+}
+
 static void
 setup_ctx_with_fork_width( fd_replay_tile_t * ctx,
                            fd_wksp_t *        wksp,
                            ulong              max_fork_width ) {
   memset( ctx, 0, sizeof(*ctx) );
+  setup_timing( ctx, wksp );
 
   /* Reasm */
 
@@ -282,6 +300,11 @@ setup_ctx_with_fork_width( fd_replay_tile_t * ctx,
   ctx->block_id_map_seed = 42UL;
   ctx->block_id_map = fd_block_id_map_join( fd_block_id_map_new( bid_map_mem, chain_cnt, ctx->block_id_map_seed ) );
   FD_TEST( ctx->block_id_map );
+
+  ctx->reception_stats_cnt = bid_cnt;
+  ctx->reception_stats = fd_wksp_alloc_laddr( wksp, alignof(fd_reception_stats_t), sizeof(fd_reception_stats_t)*bid_cnt, 1UL );
+  FD_TEST( ctx->reception_stats );
+  for( ulong i=0UL; i<ctx->reception_stats_cnt; i++ ) ctx->reception_stats[ i ].slot = ULONG_MAX;
 
   /* Mock store — fd_store_fec_data needs store_gaddr */
 
@@ -322,7 +345,8 @@ setup_ctx_with_fork_width( fd_replay_tile_t * ctx,
   ctx->next_leader_tickcount = LONG_MAX;
   ctx->reset_slot            = 0UL;
   ctx->tick_per_ns           = fd_tempo_tick_per_ns( NULL );
-  ctx->block_id_len = bid_cnt;
+  ctx->block_id_len   = bid_cnt;
+  ctx->max_live_slots = bid_cnt;
   ctx->consensus_root_slot     = ULONG_MAX;
   ctx->published_root_slot     = ULONG_MAX;
   ctx->published_root_bank_idx = root_bank->idx;
@@ -374,6 +398,41 @@ init_root_fec( fd_replay_tile_t * ctx,
 }
 
 static fd_reasm_fec_t *
+ingest_fec_complete_with_metrics( fd_replay_tile_t *               ctx,
+                                  fd_hash_t const *                merkle_root,
+                                  fd_hash_t const *                chained_merkle_root,
+                                  ulong                            slot,
+                                  uint                             fec_set_idx,
+                                  ushort                           parent_off,
+                                  ushort                           data_cnt,
+                                  int                              data_complete,
+                                  int                              slot_complete,
+                                  fd_fec_complete_metrics_t const * metrics ) {
+  ulong chunk = ctx->in[ TEST_REPAIR_IN_IDX ].chunk0;
+  fd_repair_fec_complete_t * complete_msg = fd_chunk_to_laddr( ctx->in[ TEST_REPAIR_IN_IDX ].mem, chunk );
+  memset( complete_msg, 0, sizeof(fd_repair_fec_complete_t) );
+
+  complete_msg->fec.merkle_root         = *merkle_root;
+  complete_msg->fec.chained_merkle_root = *chained_merkle_root;
+  complete_msg->fec.last_shred_hdr.slot        = slot;
+  complete_msg->fec.last_shred_hdr.fec_set_idx = fec_set_idx;
+  complete_msg->fec.last_shred_hdr.idx         = fec_set_idx + (uint)data_cnt - 1U;
+  complete_msg->fec.last_shred_hdr.data.parent_off = parent_off;
+  complete_msg->fec.last_shred_hdr.data.flags =
+    (uchar)( fd_uchar_if( data_complete, FD_SHRED_DATA_FLAG_DATA_COMPLETE, 0U ) |
+             fd_uchar_if( slot_complete, FD_SHRED_DATA_FLAG_SLOT_COMPLETE, 0U ) );
+  if( metrics ) complete_msg->metrics = *metrics;
+
+  FD_TEST( !returnable_frag( ctx, TEST_REPAIR_IN_IDX, 0UL, REPAIR_SIG_FEC, chunk,
+                             sizeof(fd_repair_fec_complete_t), 0UL, 0UL,
+                             fd_frag_meta_ts_comp( fd_tickcount() ), test_stem ) );
+
+  fd_reasm_fec_t * fec = fd_reasm_query( ctx->reasm, merkle_root );
+  FD_TEST( fec );
+  return fec;
+}
+
+static fd_reasm_fec_t *
 ingest_fec_complete( fd_replay_tile_t * ctx,
                      fd_hash_t const *  merkle_root,
                      fd_hash_t const *  chained_merkle_root,
@@ -383,27 +442,131 @@ ingest_fec_complete( fd_replay_tile_t * ctx,
                      ushort             data_cnt,
                      int                data_complete,
                      int                slot_complete ) {
-  ulong chunk = ctx->in[ TEST_REPAIR_IN_IDX ].chunk0;
-  fd_fec_complete_t * complete_msg = fd_chunk_to_laddr( ctx->in[ TEST_REPAIR_IN_IDX ].mem, chunk );
-  memset( complete_msg, 0, sizeof(fd_fec_complete_t) );
+  return ingest_fec_complete_with_metrics( ctx, merkle_root, chained_merkle_root, slot, fec_set_idx,
+                                           parent_off, data_cnt, data_complete, slot_complete, NULL );
+}
 
-  complete_msg->merkle_root         = *merkle_root;
-  complete_msg->chained_merkle_root = *chained_merkle_root;
-  complete_msg->last_shred_hdr.slot        = slot;
-  complete_msg->last_shred_hdr.fec_set_idx = fec_set_idx;
-  complete_msg->last_shred_hdr.idx         = fec_set_idx + (uint)data_cnt - 1U;
-  complete_msg->last_shred_hdr.data.parent_off = parent_off;
-  complete_msg->last_shred_hdr.data.flags =
-    (uchar)( fd_uchar_if( data_complete, FD_SHRED_DATA_FLAG_DATA_COMPLETE, 0U ) |
-             fd_uchar_if( slot_complete, FD_SHRED_DATA_FLAG_SLOT_COMPLETE, 0U ) );
+static void
+assert_reception_event_matches( fd_event_block_completed_t const * ev,
+                                fd_fec_complete_metrics_t const *  metrics,
+                                uint                               fec_set_idx ) {
+  FD_TEST( ev->last_completed_fec_set_index==fec_set_idx );
+  FD_TEST( ev->turbine_shred_count==metrics->blk_turbine_cnt );
+  FD_TEST( ev->repair_shred_count==metrics->blk_repair_cnt );
+  FD_TEST( ev->recovered_shred_count==metrics->blk_recovered_cnt );
+  FD_TEST( ev->data_shred_count==metrics->blk_data_cnt );
+  FD_TEST( ev->parity_shred_count==metrics->blk_parity_cnt );
+  FD_TEST( ev->chain_confirmed==!!metrics->blk_chain_confirmed );
+  FD_TEST( ev->slot_complete_flag==!!metrics->blk_slot_complete );
+  FD_TEST( ev->lowest_verified_fec_index==metrics->blk_lowest_verified_fec );
+  FD_TEST( ev->repair_request_window_count==metrics->blk_req_window_cnt );
+  FD_TEST( ev->repair_request_highest_window_count==metrics->blk_req_highest_cnt );
+  FD_TEST( ev->repair_request_orphan_count==metrics->blk_req_orphan_cnt );
+  FD_TEST( ev->repair_responses_received==metrics->blk_repair_responses );
+  FD_TEST( ev->repair_requests_retransmitted==metrics->blk_req_retransmit_cnt );
+  FD_TEST( ev->repair_failed_chain_verify==!!metrics->blk_chain_verify_failed );
+  FD_TEST( ev->first_shred_received_time==metrics->blk_first_shred_ts_nanos );
+  FD_TEST( ev->last_shred_received_time==metrics->blk_last_shred_ts_nanos );
+  FD_TEST( ev->first_repair_request_time==metrics->blk_first_req_ts_nanos );
+  FD_TEST( ev->last_repair_received_time==metrics->blk_last_repair_resp_ts_nanos );
+}
 
-  FD_TEST( !returnable_frag( ctx, TEST_REPAIR_IN_IDX, 0UL, REPAIR_SIG_FEC, chunk,
-                             sizeof(fd_fec_complete_t), 0UL, 0UL,
-                             fd_frag_meta_ts_comp( fd_tickcount() ), test_stem ) );
+static void
+test_reception_metrics_sidecar( fd_wksp_t * wksp ) {
+  static fd_replay_tile_t ctx[1];
+  setup_ctx( ctx, wksp );
 
-  fd_reasm_fec_t * fec = fd_reasm_query( ctx->reasm, merkle_root );
-  FD_TEST( fec );
-  return fec;
+  fd_hash_t mr_root = { .ul = { 100UL } };
+  fd_hash_t mr1_0   = { .ul = { 200UL } };
+  fd_hash_t mr1_32  = { .ul = { 300UL } };
+  fd_hash_t mr1_64  = { .ul = { 400UL } };
+  fd_hash_t mr1_0_b = { .ul = { 500UL } };
+  init_root_fec( ctx, &mr_root );
+
+  fd_fec_complete_metrics_t metrics_a = {
+    .stats_valid                   = 1U,
+    .blk_turbine_cnt               = 1U,
+    .blk_repair_cnt                = 2U,
+    .blk_recovered_cnt             = 3U,
+    .blk_data_cnt                  = 4U,
+    .blk_parity_cnt                = 5U,
+    .blk_lowest_verified_fec       = 6U,
+    .blk_chain_confirmed           = 1U,
+    .blk_slot_complete             = 0U,
+    .blk_req_window_cnt            = 7U,
+    .blk_req_highest_cnt           = 8U,
+    .blk_req_orphan_cnt            = 9U,
+    .blk_req_retransmit_cnt        = 10U,
+    .blk_repair_responses          = 11U,
+    .blk_chain_verify_failed       = 0U,
+    .fec_completed_ts_nanos        = 12UL,
+    .blk_first_shred_ts_nanos      = 13UL,
+    .blk_last_shred_ts_nanos       = 14UL,
+    .blk_first_req_ts_nanos        = 15UL,
+    .blk_last_repair_resp_ts_nanos = 16UL,
+  };
+
+  fd_reasm_fec_t * f1_0 = ingest_fec_complete_with_metrics( ctx, &mr1_0, &mr_root,
+      1UL, 0U, 1U, 32U, 1, 0, &metrics_a );
+  FD_TEST( f1_0->fec_completed_ts_nanos==metrics_a.fec_completed_ts_nanos );
+  FD_TEST( ctx->reception_stats[ 1UL % ctx->reception_stats_cnt ].slot==1UL );
+
+  fd_fec_complete_metrics_t metrics_invalid = {
+    .stats_valid            = 0U,
+    .fec_completed_ts_nanos = 22UL,
+  };
+  fd_reasm_fec_t * f1_32 = ingest_fec_complete_with_metrics( ctx, &mr1_32, &mr1_0,
+      1UL, 32U, 1U, 32U, 1, 0, &metrics_invalid );
+  FD_TEST( f1_32->fec_completed_ts_nanos==metrics_invalid.fec_completed_ts_nanos );
+
+  fd_event_block_completed_t ev = {0};
+  block_completed_event_fill_reception( ctx, &ev, &mr1_32, 1UL );
+  FD_TEST( ev.fec_set_count==2UL );
+  assert_reception_event_matches( &ev, &metrics_a, 0U );
+
+  fd_fec_complete_metrics_t metrics_b = metrics_a;
+  metrics_b.blk_turbine_cnt        = 21U;
+  metrics_b.blk_slot_complete      = 1U;
+  metrics_b.fec_completed_ts_nanos = 23UL;
+  fd_reasm_fec_t * f1_64 = ingest_fec_complete_with_metrics( ctx, &mr1_64, &mr1_32,
+      1UL, 64U, 1U, 32U, 1, 1, &metrics_b );
+  FD_TEST( f1_64->fec_completed_ts_nanos==metrics_b.fec_completed_ts_nanos );
+  FD_TEST( ctx->reception_stats[ 1UL % ctx->reception_stats_cnt ].slot==1UL );
+
+  memset( &ev, 0, sizeof(ev) );
+  block_completed_event_fill_reception( ctx, &ev, &mr1_64, 1UL );
+  assert_reception_event_matches( &ev, &metrics_b, 64U );
+
+  fd_fec_complete_metrics_t metrics_c = metrics_a;
+  metrics_c.blk_turbine_cnt        = 31U;
+  metrics_c.fec_completed_ts_nanos = 32UL;
+  fd_reasm_fec_t * f1_0_b = ingest_fec_complete_with_metrics( ctx, &mr1_0_b, &mr_root,
+      1UL, 0U, 1U, 32U, 1, 1, &metrics_c );
+  FD_TEST( f1_0_b->eqvoc );
+  FD_TEST( ctx->reception_stats[ 1UL % ctx->reception_stats_cnt ].slot==1UL );
+
+  memset( &ev, 0, sizeof(ev) );
+  block_completed_event_fill_reception( ctx, &ev, &mr1_64, 1UL );
+  assert_reception_event_matches( &ev, &metrics_c, 0U );
+
+  memset( &ev, 0, sizeof(ev) );
+  block_completed_event_fill_reception( ctx, &ev, &mr1_0_b, 1UL );
+  assert_reception_event_matches( &ev, &metrics_c, 0U );
+
+  fd_fec_complete_metrics_t capacity_metrics = metrics_a;
+  for( ulong slot=1UL; slot<=TEST_BANKS_MAX+1UL; slot++ ) {
+    capacity_metrics.blk_turbine_cnt = (uint)slot;
+    fd_reception_stats_t * stats = &ctx->reception_stats[ slot % ctx->reception_stats_cnt ];
+    stats->slot        = slot;
+    stats->fec_set_idx = (uint)slot;
+    stats->metrics     = capacity_metrics;
+  }
+  FD_TEST( ctx->reception_stats[ 1UL % ctx->reception_stats_cnt ].slot!=1UL );
+  fd_reception_stats_t * latest = &ctx->reception_stats[ (TEST_BANKS_MAX+1UL) % ctx->reception_stats_cnt ];
+  FD_TEST( latest->slot==TEST_BANKS_MAX+1UL );
+  FD_TEST( latest->metrics.blk_turbine_cnt==TEST_BANKS_MAX+1UL );
+
+  FD_LOG_NOTICE(( "pass: test_reception_metrics_sidecar" ));
 }
 
 static int
@@ -484,6 +647,7 @@ static void
 test_consensus_root_notification_handoff( fd_wksp_t * wksp ) {
   static fd_replay_tile_t ctx[ 1 ];
   memset( ctx, 0, sizeof(*ctx) );
+  setup_timing( ctx, wksp );
   setup_stem( ctx, wksp );
 
   ulong const bank_cnt = 4UL;
@@ -515,7 +679,8 @@ test_consensus_root_notification_handoff( fd_wksp_t * wksp ) {
   FD_TEST( map_mem );
   ctx->block_id_map = fd_block_id_map_join( fd_block_id_map_new( map_mem, chain_cnt, 44UL ) );
   FD_TEST( ctx->block_id_map );
-  ctx->block_id_len = bank_cnt;
+  ctx->block_id_len   = bank_cnt;
+  ctx->max_live_slots = bank_cnt;
 
   void * reasm_mem = fd_wksp_alloc_laddr( wksp, fd_reasm_align(), fd_reasm_footprint( 2UL ), 1UL );
   FD_TEST( reasm_mem );
@@ -1723,6 +1888,7 @@ main( int     argc,
   fd_wksp_t * wksp      = fd_wksp_new_anonymous( fd_cstr_to_shmem_page_sz( _page_sz ), page_cnt, fd_shmem_cpu_idx( numa_idx ), "wksp", 0UL );
   FD_TEST( wksp );
 
+  test_reception_metrics_sidecar( wksp );             fd_wksp_reset( wksp, 42U );
   test_consensus_root_notification_handoff( wksp ); fd_wksp_reset( wksp, 42U );
   test_epoch_boundary_fork_width_evict( wksp );     fd_wksp_reset( wksp, 42U );
   test_banks_full_prune_leaf( wksp );               fd_wksp_reset( wksp, 42U );

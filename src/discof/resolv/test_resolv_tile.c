@@ -4,6 +4,8 @@
 #include "../../util/tmpl/fd_unit_test.c"
 
 #define TOPO_TAG 2UL
+#define TEST_MAX_LIVE_SLOTS 32UL
+#define TEST_HASH_SEED (0x0123456789abcdefUL)
 
 static fd_svm_mini_t * mini;
 static uchar           metrics_scratch[ FD_METRICS_FOOTPRINT( 0UL ) ] __attribute__((aligned(FD_METRICS_ALIGN)));
@@ -164,20 +166,25 @@ test_env_create( test_env_t * env ) {
     .out_reliable        = env->out_reliable
   };
 
-  env->tile_mem = fd_wksp_alloc_laddr( mini->wksp, scratch_align(), scratch_footprint( NULL ), TOPO_TAG );
+  fd_topo_tile_t tile = {0};
+  tile.resolv.max_live_slots = TEST_MAX_LIVE_SLOTS;
+  env->tile_mem = fd_wksp_alloc_laddr( mini->wksp, scratch_align(), scratch_footprint( &tile ), TOPO_TAG );
   FD_TEST( env->tile_mem );
   FD_SCRATCH_ALLOC_INIT( l, env->tile_mem );
   env->ctx = FD_SCRATCH_ALLOC_APPEND( l, alignof(fd_resolv_ctx_t), sizeof(fd_resolv_ctx_t) );
   fd_memset( env->ctx, 0, sizeof(fd_resolv_ctx_t) );
+  env->ctx->startup_gate->started = 1;
 
   env->ctx->completed_slot     = 200UL;
   env->ctx->flush_pool_idx     = ULONG_MAX;
   env->ctx->pool               = pool_join( pool_new( FD_SCRATCH_ALLOC_APPEND( l, pool_align(), pool_footprint( 1UL<<16UL ) ), 1UL<<16UL ) );
-  env->ctx->map_chain          = map_chain_join( map_chain_new( FD_SCRATCH_ALLOC_APPEND( l, map_chain_align(), map_chain_footprint( 8192UL ) ), 8192UL, 0UL ) );
-  env->ctx->blockhash_map      = map_join( map_new( FD_SCRATCH_ALLOC_APPEND( l, map_align(), map_footprint() ) ) );
+  env->ctx->map_chain          = map_chain_join( map_chain_new( FD_SCRATCH_ALLOC_APPEND( l, map_chain_align(), map_chain_footprint( 8192UL ) ), 8192UL, TEST_HASH_SEED ) );
+  env->ctx->blockhash_map      = map_join( map_new( FD_SCRATCH_ALLOC_APPEND( l, map_align(), map_footprint( MAP_LG_SLOT_CNT ) ), MAP_LG_SLOT_CNT, TEST_HASH_SEED ) );
   FD_TEST( env->ctx->pool );
   FD_TEST( env->ctx->map_chain );
+  FD_TEST( map_chain_seed( env->ctx->map_chain )==TEST_HASH_SEED );
   FD_TEST( env->ctx->blockhash_map );
+  FD_TEST( map_seed( env->ctx->blockhash_map )==TEST_HASH_SEED );
   FD_TEST( env->ctx->lru_list==lru_list_join( lru_list_new( env->ctx->lru_list ) ) );
 
   env->ctx->in[0].kind = IN_KIND_DEDUP;
@@ -204,6 +211,72 @@ test_env_destroy( test_env_t * env ) {
     fd_wksp_free_laddr( fd_dcache_delete( fd_dcache_leave( env->out_dcache[i] ) ) );
   }
   fd_memset( env, 0, sizeof(test_env_t) );
+}
+
+FD_UNIT_TEST( resolv_blockhash_map_hashes_full_key ) {
+# define COLLISION_CNT (64UL)
+  void * map_mem = fd_wksp_alloc_laddr( mini->wksp, map_align(), map_footprint( MAP_LG_SLOT_CNT ), TOPO_TAG );
+  FD_TEST( map_mem );
+  blockhash_map_t * blockhash_map = map_join( map_new( map_mem, MAP_LG_SLOT_CNT, TEST_HASH_SEED ) );
+  FD_TEST( blockhash_map );
+  FD_TEST( map_seed( blockhash_map )==TEST_HASH_SEED );
+
+  blockhash_map_t * inserted[ COLLISION_CNT ];
+  for( ulong i=0UL; i<COLLISION_CNT; i++ ) {
+    blockhash_t key = {0};
+    uint  prefix = 0x12345678U;
+    ulong suffix = i+1UL;
+    fd_memcpy( key.b,     &prefix, sizeof(prefix) );
+    fd_memcpy( key.b+8UL, &suffix, sizeof(suffix) );
+    inserted[ i ] = map_insert( blockhash_map, key );
+    FD_TEST( inserted[ i ] );
+  }
+
+  ulong adjacent_cnt = 0UL;
+  for( ulong i=1UL; i<COLLISION_CNT; i++ )
+    adjacent_cnt += inserted[ i ]==inserted[ i-1UL ]+1;
+  FD_TEST( adjacent_cnt<COLLISION_CNT/2UL );
+
+  fd_wksp_free_laddr( map_leave( blockhash_map ) );
+# undef COLLISION_CNT
+}
+
+FD_UNIT_TEST( resolv_stash_map_hashes_full_key ) {
+  blockhash_t key0 = {0};
+  blockhash_t key1 = {0};
+  key1.b[ 31UL ] = 1U;
+
+  blockhash_t * key0_ptr = &key0;
+  blockhash_t * key1_ptr = &key1;
+
+  ulong hash0 = map_chain_key_hash( &key0_ptr, TEST_HASH_SEED );
+  ulong hash1 = map_chain_key_hash( &key1_ptr, TEST_HASH_SEED );
+
+  FD_TEST( hash0==fd_hash( TEST_HASH_SEED, key0.b, sizeof(key0.b) ) );
+  FD_TEST( hash1==fd_hash( TEST_HASH_SEED, key1.b, sizeof(key1.b) ) );
+  FD_TEST( hash0!=hash1 );
+}
+
+FD_UNIT_TEST( resolv_stash_map_seed_initialized ) {
+  void * tile_mem = fd_wksp_alloc_laddr( mini->wksp, alignof(fd_resolv_ctx_t), sizeof(fd_resolv_ctx_t), TOPO_TAG );
+  FD_TEST( tile_mem );
+
+  static fd_topo_t topo[1];
+  topo->workspaces[ 0 ].wksp = mini->wksp;
+  topo->objs[ 0 ] = (fd_topo_obj_t) {
+    .id      = 0UL,
+    .wksp_id = 0UL,
+    .offset  = (ulong)tile_mem-(ulong)mini->wksp,
+  };
+  fd_topo_tile_t tile = { .tile_obj_id = 0UL };
+
+  fd_resolv_ctx_t * ctx = tile_mem;
+  ctx->map_seed = TEST_HASH_SEED;
+  FD_TEST( fd_tile_resolv.privileged_init );
+  fd_tile_resolv.privileged_init( topo, &tile );
+  FD_TEST( ctx->map_seed!=TEST_HASH_SEED );
+
+  fd_wksp_free_laddr( tile_mem );
 }
 
 static void
@@ -337,7 +410,7 @@ main( int     argc,
       char ** argv ) {
   fd_svm_mini_limits_t limits[1];
   fd_svm_mini_limits_default( limits );
-  limits->max_live_slots      = 32;
+  limits->max_live_slots      = TEST_MAX_LIVE_SLOTS;
   limits->max_txn_per_slot    = 32;
   limits->max_txn_write_locks = MAX_TX_ACCOUNT_LOCKS;
   limits->wksp_addl_sz        = 5UL<<30;

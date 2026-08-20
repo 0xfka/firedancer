@@ -27,8 +27,14 @@ struct FD_ALIGNED fd_poseidon {
 typedef struct fd_poseidon fd_poseidon_t;
 
 struct fd_poseidon_par {
-  fd_bn254_scalar_t * ark;
-  fd_bn254_scalar_t * mds;
+  fd_bn254_scalar_t const * ark;
+  fd_bn254_scalar_t const * mds;
+  fd_bn254_scalar_t const * ark_start;
+  fd_bn254_scalar_t const * ark_partial;
+  fd_bn254_scalar_t const * ark_end;
+  fd_bn254_scalar_t const * pre_sparse_mds;
+  fd_bn254_scalar_t const * sparse_mds_row;
+  fd_bn254_scalar_t const * sparse_mds_col;
 };
 typedef struct fd_poseidon_par fd_poseidon_par_t;
 
@@ -55,13 +61,13 @@ fd_poseidon_init( fd_poseidon_t * pos,
    the state while this is executing). out==NULL is ok to allow chaining:
      fd_poseidon_append( fd_poseidon_append( ... ) )
    data points to the first of the sz bytes, and will be unmodified while
-   this is running with no interest retained after return (data==NULL is fine if sz==0).
-   data represents a bn254 scalar, i.e. a 256-bit bigint modulo a prime.
-   If data is not exactly 32-byte long (sz!=32), then data is padded with 0s
-   during conversion.
+   this is running with no interest retained after return.
+   data represents a bn254 scalar, i.e. a 256-bit bigint modulo a prime,
+   and must be exactly 32 bytes long.
    Returns out on success, NULL in case of error:
    - if pos==NULL
-   - if data >= modulus (including sz > 32)
+   - if sz!=32
+   - if data >= modulus
    - if fd_poseidon_append is called more than 12 times on the same pos
 
    Note: unlike other hash functions, each call to fd_poseidon_append
@@ -73,8 +79,7 @@ fd_poseidon_init( fd_poseidon_t * pos,
 fd_poseidon_t *
 fd_poseidon_append( fd_poseidon_t * pos,
                     uchar const *   data,
-                    ulong           sz,
-                    int             enforce_padding );
+                    ulong           sz );
 
 /* fd_poseidon_fini finishes a Poseidon calculation.
    out is assumed to be valid (i.e. is a current local join to a Poseidon

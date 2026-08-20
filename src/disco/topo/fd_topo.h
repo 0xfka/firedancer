@@ -112,6 +112,7 @@ struct fd_topo_net_tile {
   ushort repair_client_listen_port;
   ushort repair_serve_listen_port;
   ushort txsend_src_port;
+  ushort votor_quic_server_listen_port;
 };
 typedef struct fd_topo_net_tile fd_topo_net_tile_t;
 
@@ -269,6 +270,7 @@ struct fd_topo_tile {
         ushort tpu_quic;
         ushort repair;
         ushort rserve;
+        ushort votor;
       } ports;
     } gossip;
 
@@ -480,6 +482,7 @@ struct fd_topo_tile {
         char  vote_account_path[ PATH_MAX ];
       } bundle;
 
+      int alpenglow;
     } replay;
 
     struct {
@@ -581,6 +584,12 @@ struct fd_topo_tile {
     } tower;
 
     struct {
+      char   identity_key_path[ PATH_MAX ];
+      ushort quic_server_listen_port;
+      ulong  max_live_slots;
+    } votor;
+
+    struct {
       ulong accdb_obj_id;
       ulong max_live_slots;
 
@@ -644,6 +653,7 @@ struct fd_topo_tile {
       ulong accdb_obj_id;
       ulong txncache_obj_id;
       ulong banks_obj_id;
+      int   alpenglow;
     } snapin;
 
     struct {

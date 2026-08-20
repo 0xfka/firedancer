@@ -1,4 +1,5 @@
 #include "fd_poh.h"
+#include "../../disco/tiles.h"
 
 /* The PoH implementation is at its core a state machine ...
 
@@ -90,9 +91,10 @@ fd_poh_new( void * shmem ) {
 }
 
 fd_poh_t *
-fd_poh_join( void *         shpoh,
-             fd_poh_out_t * shred_out,
-             fd_poh_out_t * replay_out ) {
+fd_poh_join( void *                         shpoh,
+             fd_poh_out_t *                 shred_out,
+             fd_poh_out_t *                 replay_out,
+             fd_leader_txn_timing_table_t * timing_tables ) {
   if( FD_UNLIKELY( !shpoh ) ) {
     FD_LOG_WARNING(( "NULL shpoh" ));
     return NULL;
@@ -113,6 +115,9 @@ fd_poh_join( void *         shpoh,
   *poh->shred_out = *shred_out;
   *poh->replay_out = *replay_out;
 
+  poh->timing_tables    = timing_tables;
+  poh->timing_table_idx = 0UL;
+
   return poh;
 }
 
@@ -127,8 +132,19 @@ transition_to_follower( fd_poh_t *          poh,
   if( FD_LIKELY( poh->state==STATE_LEADER || poh->state==STATE_WAITING_FOR_SLOT ) ) {
     fd_poh_leader_slot_ended_t * dst = fd_chunk_to_laddr( poh->replay_out->mem, poh->replay_out->chunk );
     dst->completed = completed_leader_slot;
-    dst->slot      = poh->slot-1UL;
+    dst->slot      = fd_ulong_if( completed_leader_slot, poh->slot-1UL, poh->slot );
     fd_memcpy( dst->blockhash, poh->hash, 32UL );
+
+    dst->microblock_count = poh->pack_microblock_count;
+    dst->pack_block_cost  = poh->pack_block_cost;
+    dst->pack_vote_cost   = poh->pack_vote_cost;
+    dst->pack_data_bytes  = poh->pack_data_bytes;
+    dst->bundle_txn_count = poh->pack_bundle_txn_count;
+    dst->pack_end_reason  = poh->pack_end_reason;
+    dst->pack_start_ns    = poh->pack_start_ns;
+    dst->pack_end_ns      = poh->pack_end_ns;
+    dst->timing_table_idx = poh->timing_tables ? poh->timing_table_idx : ULONG_MAX;
+
     ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
     fd_stem_publish( stem, poh->replay_out->idx, 0UL, poh->replay_out->chunk, sizeof(fd_poh_leader_slot_ended_t), 0UL, 0UL, tspub );
     poh->replay_out->chunk = fd_dcache_compact_next( poh->replay_out->chunk, sizeof(fd_poh_leader_slot_ended_t), poh->replay_out->chunk0, poh->replay_out->wmark );
@@ -187,6 +203,8 @@ fd_poh_reset( fd_poh_t *          poh,
               ulong               next_leader_slot,        /* The next slot where this node will be leader */
               ulong               max_microblocks_in_slot, /* The maximum number of microblocks that may appear in a slot */
               uchar const *       completed_block_id       /* The block id of the completed block */)  {
+  FD_TEST( memcmp( poh->completed_block_id, completed_block_id, 32UL ) );
+
   memcpy( poh->reset_hash, completed_blockhash, 32UL );
   memcpy( poh->hash, completed_blockhash, 32UL );
   memcpy( poh->completed_block_id, completed_block_id, 32UL );
@@ -248,6 +266,13 @@ fd_poh_begin_leader( fd_poh_t * poh,
   poh->microblocks_lower_bound = 0UL;
   poh->leader_slot_start_ns    = slot_start_ns;
 
+  if( FD_LIKELY( poh->timing_tables ) ) {
+    poh->timing_table_idx ^= 1UL;
+    fd_leader_txn_timing_table_t * table = &poh->timing_tables[ poh->timing_table_idx ];
+    table->slot = slot;
+    table->cnt  = 0UL;
+  }
+
   FD_LOG_INFO(( "begin_leader(slot=%lu, last_slot=%lu, last_hashcnt=%lu)", slot, poh->last_slot, poh->last_hashcnt ));
 }
 
@@ -290,8 +315,11 @@ fd_poh_update_max_microblocks( fd_poh_t * poh,
 }
 
 void
-fd_poh_done_packing( fd_poh_t * poh,
-                     ulong      microblocks_in_slot ) {
+fd_poh_done_packing( fd_poh_t *                poh,
+                     fd_stem_context_t *       stem,
+                     fd_done_packing_t const * done_packing ) {
+  ulong microblocks_in_slot = done_packing->microblocks_in_slot;
+
   FD_TEST( poh->state==STATE_LEADER );
   FD_LOG_INFO(( "done_packing(slot=%lu,seen_microblocks=%lu,microblocks_in_slot=%lu)",
                 poh->slot,
@@ -299,6 +327,20 @@ fd_poh_done_packing( fd_poh_t * poh,
                 microblocks_in_slot ));
   FD_TEST( poh->microblocks_lower_bound==microblocks_in_slot );
   FD_TEST( poh->microblocks_lower_bound<=poh->max_microblocks_per_slot );
+
+  poh->pack_microblock_count = microblocks_in_slot;
+  poh->pack_block_cost       = done_packing->limits_usage->block_cost;
+  poh->pack_vote_cost        = done_packing->limits_usage->vote_cost;
+  poh->pack_data_bytes       = done_packing->limits_usage->block_data_bytes;
+  poh->pack_bundle_txn_count = done_packing->bundle_txn_count;
+  poh->pack_end_reason       = done_packing->end_slot_reason;
+  poh->pack_start_ns         = done_packing->pack_start_ns;
+  poh->pack_end_ns           = done_packing->pack_end_ns;
+
+  if( FD_UNLIKELY( done_packing->end_slot_reason==FD_PACK_END_SLOT_REASON_ABANDONED ) ) {
+    transition_to_follower( poh, stem, 0 );
+    return;
+  }
 
   poh->microblocks_lower_bound += 1UL /* done_packing as a phantom "microblock"*/
                                 + (poh->max_microblocks_per_slot-1UL) /* the canonical microblock limit */
@@ -695,12 +737,13 @@ publish_microblock( fd_poh_t *          poh,
 }
 
 void
-fd_poh1_mixin( fd_poh_t *          poh,
-               fd_stem_context_t * stem,
-               ulong               slot,
-               uchar const *       hash,
-               ulong               txn_cnt,
-               fd_txn_p_t const *  txns ) {
+fd_poh1_mixin( fd_poh_t *                         poh,
+               fd_stem_context_t *                stem,
+               ulong                              slot,
+               uchar const *                      hash,
+               ulong                              txn_cnt,
+               fd_txn_p_t const *                 txns,
+               fd_leader_txn_timing_rec_t const * timing ) {
   if( FD_UNLIKELY( slot!=poh->next_leader_slot || slot!=poh->slot ) ) {
     FD_LOG_ERR(( "packed too early or late slot=%lu, current_slot=%lu", slot, poh->slot ));
   }
@@ -726,6 +769,20 @@ fd_poh1_mixin( fd_poh_t *          poh,
      causing agave to think it's a tick and complain.  Instead, we just
      skip the microblock and don't hash or update the hashcnt. */
   if( FD_UNLIKELY( !executed_txn_cnt ) ) return;
+
+  if( FD_LIKELY( poh->timing_tables ) ) {
+    fd_leader_txn_timing_table_t * table = &poh->timing_tables[ poh->timing_table_idx ];
+    long poh_mixed_ticks = fd_tickcount();
+    for( ulong i=0UL; i<txn_cnt; i++ ) {
+      if( FD_UNLIKELY( !(txns[ i ].flags & FD_TXN_P_FLAGS_EXECUTE_SUCCESS) ) ) continue;
+      if( FD_UNLIKELY( table->cnt>=FD_MAX_TXN_PER_SLOT ) ) break;
+
+      fd_leader_txn_timing_rec_t * rec = &table->rec[ table->cnt++ ];
+      *rec = *timing;
+      rec->received_ns     = txns[ i ].first_seen_nanos;
+      rec->poh_mixed_ticks = poh_mixed_ticks;
+    }
+  }
 
   uchar data[ 64 ];
   fd_memcpy( data, poh->hash, 32UL );

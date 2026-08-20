@@ -199,9 +199,10 @@ typedef struct {
   ulong shred_buffer_sz;
   uchar shred_buffer[ FD_NET_MTU ];
 
-  /* resolver_seed gets generated in privileged_init but used in
-     unprivileged_init, so we store it here in between. */
+  /* These seeds get generated in privileged_init but used in
+     unprivileged_init, so we store them here in between. */
   ulong resolver_seed;
+  ulong shred_dest_seed;
 
   fd_shred_in_ctx_t in[ 32 ];
   int               in_kind[ 32 ];
@@ -548,13 +549,8 @@ during_frag( fd_shred_ctx_t * ctx,
                                                                      &epoch_msg->epoch_schedule,
                                                                      ctx->next_max_shred_idx_start_slot ).max_shred_idx;
     }
-    ctx->features_activation->enforce_fixed_fec_set     = fd_shred_get_feature_activation_slot0(
+    ctx->features_activation->enforce_fixed_fec_set = fd_shred_get_feature_activation_slot0(
       epoch_msg->features.enforce_fixed_fec_set, ctx );
-    ctx->features_activation->discard_unexpected_data_complete_shreds = fd_shred_get_feature_activation_slot0(
-      epoch_msg->features.discard_unexpected_data_complete_shreds, ctx );
-
-    fd_fec_resolver_set_discard_unexpected_data_complete_shreds( ctx->resolver,
-      ctx->features_activation->discard_unexpected_data_complete_shreds );
 
     return;
   }
@@ -602,8 +598,6 @@ during_frag( fd_shred_ctx_t * ctx,
       fd_shred_epoch_msg_t const * msg = (fd_shred_epoch_msg_t const *)dcache_entry;
 
       *ctx->features_activation = msg->features_activation;
-      fd_fec_resolver_set_discard_unexpected_data_complete_shreds( ctx->resolver,
-        ctx->features_activation->discard_unexpected_data_complete_shreds );
 
       if( FD_LIKELY( !ctx->larger_shred_limits_per_block ) ) {
         fd_shred_slot_limits_t const * lim    = &msg->slot_limits;
@@ -734,7 +728,9 @@ during_frag( fd_shred_ctx_t * ctx,
          would exceed the pending_batch_wmark.  If true, then the
          batch is closed now, shredded, and a new batch is started
          with the incoming microblock.  If false, no shredding takes
-         place, and the microblock is added to the current batch. */
+         place, and the microblock is added to the current batch.
+         Pack limits entry bytes so this batching cannot exceed
+         max_shred_idx. */
       int forced_end_batch         = entry_meta->block_complete | new_slot;
       int batch_would_exceed_wmark = ( ctx->pending_batch.pos + entry_sz ) > pending_batch_wmark;
       int include_in_current_batch = forced_end_batch | ( !batch_would_exceed_wmark );
@@ -1326,6 +1322,9 @@ privileged_init( fd_topo_t const *      topo,
   if( FD_UNLIKELY( !fd_rng_secure( &(ctx->resolver_seed), sizeof(ulong) ) ) ) {
     FD_LOG_CRIT(( "fd_rng_secure failed" ));
   }
+  if( FD_UNLIKELY( !fd_rng_secure( &(ctx->shred_dest_seed), sizeof(ulong) ) ) ) {
+    FD_LOG_CRIT(( "fd_rng_secure failed" ));
+  }
   /* This is only needed in frankendancer, but we'll overwrite it with
      the value the repair tile generated in full firedancer. */
   if( FD_UNLIKELY( !fd_rng_secure( ctx->repair_nonce_ss->bytes, sizeof(fd_rnonce_ss_t) ) ) ) {
@@ -1474,7 +1473,7 @@ unprivileged_init( fd_topo_t const *      topo,
 
   ctx->fec_sets = fec_sets;
 
-  ctx->stake_ci = fd_stake_ci_join( fd_stake_ci_new( _stake_ci, ctx->identity_key ) );
+  ctx->stake_ci = fd_stake_ci_join( fd_stake_ci_new( _stake_ci, ctx->identity_key, ctx->shred_dest_seed ) );
 
   ctx->net_id   = (ushort)0;
 

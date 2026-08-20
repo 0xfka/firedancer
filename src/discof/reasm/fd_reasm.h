@@ -191,12 +191,18 @@ struct __attribute__((aligned(128UL))) fd_reasm_fec {
 
   /* Data (set by caller) */
 
-  ulong bank_dead;
+  ulong bank_dead;     /* 0: live; 1: dead lineage; 2: abandoned lineage (set by replay) */
+  ulong dead_reported; /* dead telemetry row already emitted for this block */
   ulong bank_idx;
   ulong bank_seq;
   ulong parent_bank_idx;
+
+  /* Replay needs the completion timestamp for every FEC.  Detailed
+     block-level reception stats are stored separately per slot. */
+  ulong fec_completed_ts_nanos;
 };
 typedef struct fd_reasm_fec fd_reasm_fec_t;
+FD_STATIC_ASSERT( sizeof(fd_reasm_fec_t)==256UL, fd_reasm_fec_footprint );
 
 FD_PROTOTYPES_BEGIN
 
