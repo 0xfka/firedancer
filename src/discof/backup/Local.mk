@@ -12,5 +12,7 @@ ifdef FD_HAS_ATOMIC
 $(call make-unit-test,test_backup_disk,test_backup_disk,fd_discof fd_flamenco fd_funk fd_tango fd_ballet fd_util fd_disco)
 $(call run-unit-test,test_backup_disk)
 endif
+$(call make-unit-test,fd_snap_sizediff,fd_snap_sizediff,fd_discof fd_flamenco fd_funk fd_tango fd_ballet fd_util fd_disco,-lzstd)
+$(call run-unit-test,fd_snap_sizediff)
 endif
 endif
