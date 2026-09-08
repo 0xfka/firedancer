@@ -8,6 +8,55 @@ assert_eq( char const * base58,
   FD_TEST( fd_memeq( decoded, key.uc, 32UL ) );
 }
 
+
+
+static void
+test_pubkey_is_spl_token( void ) {
+  fd_pubkey_t owner[1];
+
+  fd_memcpy( owner, &fd_solana_spl_token_id, sizeof(fd_pubkey_t) );
+  FD_TEST( fd_pubkey_is_spl_token( owner ) == FD_PUBKEY_IS_SPL_TOKEN_TRUE );
+
+  fd_memcpy( owner, &fd_solana_spl_token_2022_program_id, sizeof(fd_pubkey_t) );
+  FD_TEST( fd_pubkey_is_spl_token( owner ) == FD_PUBKEY_IS_SPL_TOKEN_TRUE );
+
+
+  fd_memset( owner, 0, sizeof(fd_pubkey_t) );
+  FD_TEST( fd_pubkey_is_spl_token( owner ) == FD_PUBKEY_IS_SPL_TOKEN_FALSE );
+
+}
+
+static void
+profile_pubkey_is_spl_token( void ) {
+  ulong const workload_iter = 1048576UL;
+  ulong const warmup        =    1024UL;
+
+  fd_pubkey_t const * spl     = &fd_solana_spl_token_id;
+  fd_pubkey_t const * non_spl = &fd_solana_address_lookup_table_program_id;
+  fd_pubkey_t const * spl_2   = &fd_solana_spl_token_2022_program_id;
+
+  int c = 0;
+  fd_pubkey_t const * table[4] = { spl, non_spl, spl_2, non_spl };
+  uint state = 0x12345678U;
+  for( ulong i=0UL; i<warmup; i++ ) {
+    state = state * 1664525U + 1013904223U;
+    uint idx = (state >> 30) & 3U;
+    c += (int)fd_pubkey_is_spl_token( table[ idx ] );
+  }
+  FD_HW_MFENCE();
+  long dt = -fd_log_wallclock();
+  for( ulong i=0UL; i<workload_iter; i++ ) {
+    state = state * 1664525U + 1013904223U;
+    uint idx = (state >> 30) & 3U;
+    c += (int)fd_pubkey_is_spl_token( table[ idx ] );
+  }
+  dt += fd_log_wallclock();
+  FD_COMPILER_UNPREDICTABLE( c );
+  double ns_byte = (double)dt / ((double)workload_iter * (double)sizeof( fd_pubkey_t ));
+  double gbps    = 8.0 / ns_byte;
+  FD_LOG_NOTICE(( "fd_pubkey_is_spl_token: %.3f Gbps ", gbps ));
+}
+
 static inline int
 old_fd_pubkey_is_active_reserved( fd_pubkey_t const * acct ) {
   if( memcmp( acct->key, fd_solana_bpf_loader_program_id.key, sizeof(fd_pubkey_t) )==0 ) return 1;
@@ -54,6 +103,10 @@ int
 main( int     argc,
       char ** argv ) {
   fd_boot( &argc, &argv );
+
+  int extra_benchmark = fd_env_strip_cmdline_contains( &argc, &argv, "--extra-bench" );
+
+  test_pubkey_is_spl_token();
 
   assert_eq( "Sysvar1111111111111111111111111111111111111", fd_sysvar_owner_id                          );
   assert_eq( "SysvarRecentB1ockHashes11111111111111111111", fd_sysvar_recent_block_hashes_id            );
@@ -134,6 +187,8 @@ main( int     argc,
     FD_TEST( fd_pubkey_is_active_reserved_key( decoded )==old_fd_pubkey_is_active_reserved( decoded ) );
     FD_TEST( fd_pubkey_is_pending_reserved_key( decoded )==old_fd_pubkey_is_pending_reserved( decoded ) );
   }
+
+  if( extra_benchmark ) profile_pubkey_is_spl_token();
 
   FD_LOG_NOTICE(( "pass" ));
   fd_halt();

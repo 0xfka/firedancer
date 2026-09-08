@@ -17,6 +17,7 @@
 #include "fd_backup.h"
 #include "fd_backup_cache.h"
 #include "fd_backup_shmem.h"
+#include "../../flamenco/runtime/fd_system_ids.h"
 #include "../../disco/metrics/fd_metrics.h"
 #include "../../disco/stem/fd_stem.h"
 #include "../../disco/topo/fd_topo.h"
@@ -34,6 +35,30 @@
 #define COMP_HEAD     522 /* 10 byte Zstandard uncompressed header + 512 byte plaintext tar header */
 #define COMP_BUF_SZ   FD_ULONG_ALIGN_UP( COMP_HEAD+COMP_BOUND+8UL, 4096UL )
 
+/* Queueing SPL accounts
+ * At FD_BACKUP_ORIG_ACC_DISK_BATCH, which processes most % of total accdb    on    snapmk, before writing data into raw buffer,
+  QUEUE_CNT of QUEUE_BUF_SZ stage buffers are used, which determined by QUEUE_SPL and QUEUE_NON_SPL status.
+
+  This allows zstd sliding window to find more reference pubkeys and should improve compression speed/ratio. TODO: edit after perf results collected
+  Because the sliding window is 512 kB, everything above it is unnecessary for QUEUE_BUF_SZ.
+
+  Because the snapzp still operates on raw buffer, queueing mechanism doesn't affects linear snapzp state machine nor breaks it.
+  Keep in mind that because there's no fragmentation logic on this implementation, one stage buffer must be at least the size of maximum data it may need to hold at once. */
+
+ /* TODO: Profile queueing such as:
+ *  QUEUE_SPL 2022 / QUEUE_SPL
+ *  Bucketing with other common pubkeys
+ *  and maybe more
+ */
+
+/* Queue buffer params  */
+// TODO: This may need to be named as stage buffer ?
+#define QUEUE_BUF_SZ  (320UL<<10) // per buf
+#define QUEUE_CNT     2
+#define QUEUE_SPL     ( FD_PUBKEY_IS_SPL_TOKEN_TRUE )
+#define QUEUE_NON_SPL ( FD_PUBKEY_IS_SPL_TOKEN_FALSE )
+#define QUEUE_BUF_SZ_MINIMUM ( FD_ULONG_ALIGN_UP( FD_BACKUP_RD_MTU + sizeof (snap_acc_hdr_t) - sizeof(fd_accdb_disk_meta_t), 8))
+FD_STATIC_ASSERT(QUEUE_BUF_SZ >= QUEUE_BUF_SZ_MINIMUM, queue_buf_too_small);
 struct fd_snapzp {
   fd_backup_cache_t  acc_cache[1];
 
@@ -98,6 +123,13 @@ struct fd_snapzp {
     ulong io_blocked_ticks;
     ulong compress_ticks;
   } metrics;
+  struct {
+    /* Aligned for AVX operations,
+       64 is enough for up to 512 bit registers
+       TODO: this comment looks unnecessary  */
+    __attribute__((aligned(64))) uchar mem[ QUEUE_BUF_SZ ];
+    ulong cur;
+  } queue_ctx[ QUEUE_CNT ];
 
   __attribute__((aligned(4096))) uchar raw_buf1 [ RAW_BUF_SZ  ];
   __attribute__((aligned(4096))) uchar comp_buf1[ COMP_BUF_SZ ];
@@ -312,6 +344,9 @@ msg_start( fd_snapzp_t *                 ctx,
   ctx->raw_buf.size  = 0UL;
   ctx->comp_buf.pos  = 0UL;
   ctx->comp_buf.size = COMP_BUF_SZ-COMP_HEAD;
+  for(ulong i = 0; i < QUEUE_CNT; i++){
+  ctx->queue_ctx[i].cur = 0UL;
+  }
 }
 
 /* zip_work does opportunistic Zstandard compression work in memory.
@@ -422,6 +457,31 @@ zip_flush( fd_snapzp_t * ctx ) {
 
   /* Free compressed buffer */
   ctx->comp_buf.pos = 0UL;
+}
+
+/* queue_flush writes all the stage buffers used by queues to raw buffer */
+static void
+queue_flush_all( fd_snapzp_t * ctx ){
+  for(ulong i = 0; i < QUEUE_CNT; i++){
+    if(FD_UNLIKELY( ctx->raw_buf.size + ctx->queue_ctx[ i ].cur > RAW_BUF_SZ )) {
+      zip_flush ( ctx );
+    }
+    fd_memcpy(ctx->raw + ctx->raw_buf.size,ctx->queue_ctx[i].mem, ctx->queue_ctx[i].cur);
+    ctx->raw_buf.size += ctx->queue_ctx[i].cur;
+    ctx->queue_ctx[i].cur = 0UL;
+    zip_work( ctx );
+    }
+}
+/* queue_flush_stage writes only given stage buffer to raw buffer */
+static void
+queue_flush_stage( fd_snapzp_t * ctx, uint queue){
+  if(FD_UNLIKELY( ctx->raw_buf.size + ctx->queue_ctx[ queue ].cur > RAW_BUF_SZ )){
+    zip_flush ( ctx );
+  }
+  fd_memcpy(ctx->raw + ctx->raw_buf.size,ctx->queue_ctx[ queue ].mem, ctx->queue_ctx[queue].cur);
+  ctx->raw_buf.size += ctx->queue_ctx[queue].cur;
+  ctx->queue_ctx[queue].cur = 0UL;
+  zip_work ( ctx );
 }
 
 /* accmeta_await_evict waits until the account data belonging to the
@@ -759,27 +819,31 @@ msg_acc_disk_batch( fd_snapzp_t *                      ctx,
     ulong rec_sz   = sizeof(snap_acc_hdr_t) + fd_ulong_align_up( data_len, 8UL );
     ulong data_pad = fd_ulong_align_up( data_len, 8UL ) - data_len;
     FD_CHECK_CRIT( rec_sz<=RAW_BUF_SZ, "oversize snapshot account record" );
-    if( FD_UNLIKELY( ctx->raw_buf.size + rec_sz > RAW_BUF_SZ ) ) {
-      zip_flush( ctx );
+    uint is_spl = fd_pubkey_is_spl_token( (fd_pubkey_t const *)dm->owner );
+      /* Flush if no space left
+       TODO: this comment looks unnecessary, I added here as a quick note at development, but the risk is real.
+       Doing boundary checks one by one can cause data corruption ( e.g, enough size for header but flush before data )
+       */
+    if( FD_UNLIKELY( ctx->queue_ctx[ is_spl ].cur + rec_sz > (ulong)QUEUE_BUF_SZ )){
+      queue_flush_stage( ctx, is_spl );
     }
-
-    snap_acc_hdr_t * hdr = (snap_acc_hdr_t *)( ctx->raw + ctx->raw_buf.size );
+    snap_acc_hdr_t * hdr = (snap_acc_hdr_t *)( ctx->queue_ctx[ is_spl ].mem + ctx->queue_ctx[ is_spl ].cur );
     memset( hdr, 0, sizeof(snap_acc_hdr_t) );
     memcpy( hdr->pubkey.uc, dm->pubkey, sizeof(fd_pubkey_t) );
     memcpy( hdr->owner.uc,  dm->owner,  sizeof(fd_pubkey_t) );
     hdr->lamports   = lamports[ i ];
     hdr->executable = !!FD_ACCDB_SIZE_EXEC( exec_sz[ i ] );
     hdr->data_len   = data_len;
-    ctx->raw_buf.size += sizeof(snap_acc_hdr_t);
+    ctx->queue_ctx[ is_spl].cur += sizeof(snap_acc_hdr_t);
 
     if( FD_LIKELY( data_len ) ) {
       uchar const * data = base + batch->frag_off[ i ] + sizeof(fd_accdb_disk_meta_t);
-      fd_memcpy( ctx->raw + ctx->raw_buf.size, data, data_len );
-      ctx->raw_buf.size += data_len;
+      fd_memcpy( ctx->queue_ctx[ is_spl ].mem + ctx->queue_ctx[ is_spl ].cur, data, data_len );
+      ctx->queue_ctx[ is_spl ].cur += data_len;
     }
     if( data_pad ) {
-      fd_memset( ctx->raw + ctx->raw_buf.size, 0, data_pad );
-      ctx->raw_buf.size += data_pad;
+      fd_memset( ctx->queue_ctx[ is_spl ].mem + ctx->queue_ctx[ is_spl ].cur, 0, data_pad );
+      ctx->queue_ctx[ is_spl ].cur += data_pad;
     }
     ctx->snapshot_account_cnt++;
     ctx->snapshot_account_sz += rec_sz;
@@ -840,6 +904,7 @@ returnable_frag( fd_snapzp_t *       ctx,
     zip_work( ctx );
     break;
   case FD_BACKUP_ORIG_FLUSH:
+    queue_flush_all( ctx );
     zip_flush( ctx );
     fd_backup_worker_stats_t * stats = &ctx->stats->worker[ ctx->kind_id ];
     __atomic_store_n( &stats->account_cnt,         ctx->snapshot_account_cnt,        __ATOMIC_RELAXED );

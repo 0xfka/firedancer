@@ -41,6 +41,7 @@ extern const fd_pubkey_t fd_solana_compute_budget_program_id;
 extern const fd_pubkey_t fd_solana_address_lookup_table_program_id;
 extern const fd_pubkey_t fd_solana_spl_native_mint_id;
 extern const fd_pubkey_t fd_solana_spl_token_id;
+extern const fd_pubkey_t fd_solana_spl_token_2022_program_id;
 extern const fd_pubkey_t fd_solana_zk_token_proof_program_id;
 extern const fd_pubkey_t fd_solana_zk_elgamal_proof_program_id;
 extern const fd_pubkey_t fd_solana_slashing_program_id;
@@ -77,6 +78,21 @@ fd_pubkey_is_active_reserved_key( fd_pubkey_t const * acct );
 
 int
 fd_pubkey_is_pending_reserved_key( fd_pubkey_t const * acct );
+
+// TODO: consider a typedef for token classes
+#define FD_PUBKEY_IS_SPL_TOKEN_FALSE  (0U)
+#define FD_PUBKEY_IS_SPL_TOKEN_TRUE   (1U)
+
+ /* TODO: is this function should be here ? I implemented it here because
+    it is not specific to snapshot production but it seems like there's no other func here.
+ */
+FD_FN_PURE static inline uint
+fd_pubkey_is_spl_token( fd_pubkey_t const * pubkey ) {
+  return (uint)( fd_memeq( pubkey, fd_solana_spl_token_id.uc,
+                           sizeof(fd_pubkey_t) ) |
+                 fd_memeq( pubkey, fd_solana_spl_token_2022_program_id.uc,
+                           sizeof(fd_pubkey_t) ) );
+}
 
 FD_PROTOTYPES_END
 
