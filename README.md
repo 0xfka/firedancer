@@ -5,7 +5,7 @@ For all my sent PR's ( including drafts meant for a quick review from maintainer
 A quick summary of the work:
 
 ### **accelerate fd_hash via AVX-512 256 bit registers**
-Shaved %22~ from fd_hash function under stable profiling with hand written SIMD, at multiple of 32 path, which means the implementation performs way better on multiple on 32, and worse than that at multiple of 32 + x(where x < 32) but still better than the baseline.
+Shaved ~22% from fd_hash function under stable profiling with hand written SIMD, at multiple of 32 path, which means the implementation performs way better on multiples of 32, and worse than that at multiple of 32 + x(where x < 32) but still better than the baseline.
 see [github](https://github.com/0xfka/firedancer/blob/fd-hash-avx512/src/util/fd_hash.c) for source code, [pr 10575](https://github.com/firedancer-io/firedancer/pull/10575) for benchmark harness I coded for it so I can optimize, [pr 10620](https://github.com/firedancer-io/firedancer/pull/10620) for how I profiled the code and the detailed results.
 
 ###  **Zstandard frame scanner**
@@ -16,22 +16,33 @@ Can be tested with:
 ```console
 git clone git@github.com:0xfka/firedancer.git
 cd firedancer
-git checkout frame_wip // Named wip when I needed to send it as a draft PR. Works reliably.
+git checkout frame_wip # Named wip when I needed to send it as a draft PR. Works reliably.
 make -j$(nproc) test_zstd
 ./build/native/gcc/unit-test/test_zstd
 ```
-And start/sizes are printed. The source code can definitely ported into a streaming, returning value, or similar patterns.
+And start/sizes are printed. The source code can definitely be ported into a streaming, returning value, or similar patterns.
 
 A dummy file generated with Linux's /dev/urandom and provided at project root, named "multi_frame_hundreds.zst", can be changed. The code returns 0 on error, and frame count if not.
 
 Because usual error paths we had at that parser can cause segfaults or reading garbage, which can create a malformed state, *Flag based error handling ( setting a flag on error and check if( flag==1 ) only once )* is not possible.
-Cmov is a data-flow instruction, not a control-flow instruction, so it requires both paths to must be secure to compute, (e.g, no jump/returns, no potantial segfaults or similar,etc.) which ending up using actual branches with unlikely compiler hint.
+Cmov is a data-flow instruction, not a control-flow instruction, so it requires both paths must be safe to evaluate (e.g. no jump/returns, no potential segfaults or similar, etc.), which ended up requiring actual branches with unlikely compiler hints.
 
-This branch was superseded because of a developer race on coordination.
+This branch was superseded due to overlapping work upstream.
 
 Note that this code is not tuned or profiled because it is only used at snapshot load and the possible performance gains may coming from the single/multi core difference, not from micro optimizations.
 
 This branch may be updated with streaming support at scanner + concurrency with benchmarks, showing upstream single core as baseline.
+
+### **Experiments on snapshot-create pipeline**
+After finding out global sorting based on owner pubkey as key 1 and mint as key 2 was shaving the sizes up to 20%+ from firedancer's size, which even passes agave, I hit
+hardware limitations when trying to implement it to the upstream production pipeline :
+First, I added staging & queueing with stage buffers inside FD_BACKUP_ORIG_ACC_DISK_BATCH, which is responsible for highest % of the accdb at snapzp, and was already parsing the accounts, which means lower overhead than others.
+Because 1 staging buffer must be at least the size of
+header + max data len this function can receive ( also keep in mind the aligning ), 1 buffer must be at least
+262208 bytes ( see QUEUE_BUF_SZ_MINIMUM ), and we need at least 2 of them, 524416 bytes, which exceeds many L2 caches on market, or at least uses a huge partition of it. After all, this queueing didn't reduce the snapshot size on a meaningful way ( 118 gb from 120 )
+and increased latency on a server that has 1 mb l2 ( amd epyc 9004, zen 5 ), even though compression time was ~6% lower.
+This direction was explored based on discussions with a Firedancer maintainer and subsequently shelved after benchmarks showed the cache overhead outweighed the benefits.
+See https://github.com/0xfka/firedancer/tree/snapshot_wip for source code.
 
 ### here goes the upstream Firedancer readme.md :
 
