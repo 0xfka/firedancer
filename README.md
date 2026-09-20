@@ -44,6 +44,12 @@ and increased latency on a server that has 1 mb l2 ( amd epyc 9004, zen 5 ), eve
 This direction was explored based on discussions with a Firedancer maintainer and subsequently shelved after benchmarks showed the cache overhead outweighed the benefits.
 See https://github.com/0xfka/firedancer/tree/snapshot_wip for source code.
 
+### **Snapshot-server slow-peer protection**
+The `snap_slowloris` branch adds a per-connection throughput guard to `snapsv`: downloads must sustain 3 MiB/s over 10-second windows by default, or the connection is aborted. Unit coverage includes both a legitimate stream and a slow peer.
+
+The minimum clean L7 traffic needed to hold all slots is approximately:
+`conn_max × 3 MiB/s` per validator (before protocol overhead and without a CDN). That is 384 MiB/s for 128 connections, or 300,000 MiB/s (~293 GiB/s, ~2.52 Tb/s) for 100,000 connections.
+
 ### here goes the upstream Firedancer readme.md :
 
 
