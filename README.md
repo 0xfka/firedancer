@@ -4,76 +4,52 @@ or experimentation.
 For all my PRs (including drafts for quick maintainer review), see
 [Firedancer pull requests filtered by author](https://github.com/firedancer-io/firedancer/pulls?q=is%3Apr+author%3A0xfka).
 
+## Branch summaries
 
-# [Firedancer](https://jumpcrypto.com/firedancer/) 🔥💃
+### **accelerate fd_hash via AVX-512 256-bit registers**
+Shaved ~22% from `fd_hash` under stable profiling with hand-written
+SIMD. The implementation performs best on `32n`-sized inputs, and is
+slower on tails of the form `32n + x` (`0 < x < 32`), while still
+beating the baseline.
+See [source code](https://github.com/0xfka/firedancer/blob/fd-hash-avx512/src/util/fd_hash.c), [PR 10575](https://github.com/firedancer-io/firedancer/pull/10575), and [PR 10620](https://github.com/firedancer-io/firedancer/pull/10620).
 
-Firedancer is a new validator client for Solana.
+### **Zstandard frame scanner**
+A helper that finds frame start/size without decompressing, allowing
+snapshot loading pipeline stages to run concurrently. Coverage included
+fuzzing with seeds from [Zstandard sample files by mcraiha](https://github.com/mcraiha/ZSTD-sample-files).
 
-* **Fast** Designed from the ground up to be *fast*. The concurrency
-model draws from experience in the low latency trading space, and the code
-contains many novel high-performance reimplementations of core Solana
-primitives.
-* **Secure** The architecture of the validator allows it to run with a
-highly restrictive sandbox and almost no system calls.
-* **Independent** Firedancer is written from scratch. This brings client
-diversity to the Solana network and helps it stay resilient to supply
-chain attacks in build tooling or dependencies.
-
-## Documentation
-If you are an operator or looking to run the validator, see the Getting
-Started guide in the [Firedancer
-docs](https://docs.firedancer.io/)
-
-## Releases
-If you are an operator looking to run the validator, see the [Releases
-Guide](https://docs.firedancer.io/guide/getting-started.html#releases)
-in the documentation.
-
-The Firedancer project is producing two validators,
-
-* **Frankendancer** A hybrid validator using parts of Firedancer and
-parts of Agave. Frankendancer uses the Firedancer networking stack and
-block production components to perform better while leader. Other
-functionality including execution and consensus is using the Agave
-validator code.
-* **Firedancer** A full from-scratch Firedancer with no Agave code.
-
-Both validators are built from this codebase. The Firedancer validator
-is not ready for test or production use and has no releases.
-Frankendancer is currently available on both Solana testnet and
-mainnet-beta.
-
-## Developing
-Firedancer currently only supports Linux and requires a relatively new
-kernel, at least v4.18 to build.
-
+Can be tested with:
 ```console
-$ git clone https://github.com/firedancer-io/firedancer.git
-$ cd firedancer
-$ ./deps.sh
-$ source activate  # enter build environment
-$ make -j
-
-# Run a new development cluster
-$ firedancer-dev
-
-# Join Solana testnet
-$ firedancer-dev --testnet
+git clone git@github.com:0xfka/firedancer.git
+cd firedancer
+git checkout frame_wip
+make -j$(nproc) test_zstd
+./build/native/gcc/unit-test/test_zstd
 ```
+The scanner prints frame starts/sizes and returns `0` on error, or the
+frame count on success.
+This branch was superseded due to overlapping work upstream.
 
-`firedancer-dev` (without args) configures your system for validator
-operation and creates a new local development cluster. First it creates
-a genesis block, some keys, a faucet, and then it starts a validator on
-the local machine. `firedancer-dev` will use `sudo` to make privileged
-changes to system configuration where needed. If `sudo` is not available,
-you may need to run the command as root.
+### **Experiments on snapshot-create pipeline**
+Global sorting by owner pubkey (key 1) and mint (key 2) reduced snapshot
+sizes by up to 20%+ versus Firedancer output in tests, but production
+integration hit hardware limits.
+Adding staging/queueing buffers in `FD_BACKUP_ORIG_ACC_DISK_BATCH`
+increased cache pressure (`QUEUE_BUF_SZ_MINIMUM` scale), and benchmarks
+showed reduced compression time (~6%) but no meaningful size win
+(`120 GB` to `118 GB`) and increased latency on a 1 MiB L2 system.
+This direction was discussed with maintainers and shelved after
+benchmarking.
+See https://github.com/0xfka/firedancer/tree/snapshot_wip for source
+code.
 
-If you wish to join this cluster with other validators, you can define
-`[gossip.entrypoints]` in the configuration file to point at your first
-validator and join with `firedancer-dev run`.
+### **Snapshot-server slow-peer protection**
+The `snap_slowloris` branch adds a per-connection throughput guard to
+`snapsv`: downloads must sustain 3 MiB/s over 10-second windows by
+default, or the connection is aborted. Unit coverage includes both a
+legitimate stream and a slow peer.
 
-## License
-Firedancer is available under the [Apache 2
-license](https://www.apache.org/licenses/LICENSE-2.0). Firedancer also
-includes external libraries that are available under a variety of
-licenses. See [LICENSE](LICENSE) for the full license text.
+Minimum clean L7 traffic to hold all slots is approximately
+`conn_max × 3 MiB/s` per validator (before protocol overhead and
+without a CDN): `384 MiB/s` for 128 connections, or `300,000 MiB/s`
+(~293 GiB/s, ~2.52 Tb/s) for 100,000 connections.
