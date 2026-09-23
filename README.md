@@ -1,8 +1,6 @@
 # About the fork
 This fork includes merged and unmerged code intended for upstreaming
 or experimentation.
-For all my PRs (including drafts for quick maintainer review), see
-[Firedancer pull requests filtered by author](https://github.com/firedancer-io/firedancer/pulls?q=is%3Apr+author%3A0xfka).
 
 ## Branch summaries
 
@@ -32,14 +30,14 @@ This branch was superseded due to overlapping work upstream.
 
 ### **Experiments on snapshot-create pipeline**
 Global sorting by owner pubkey (key 1) and mint (key 2) reduced snapshot
-sizes by up to 20%+ versus Firedancer output in tests, but production
-integration hit hardware limits.
+sizes by up to 20%+ versus Firedancer output in tests. This branch
+focused on staging/queueing and did not include sorting, and production
+integration did not meet upstream expectations due to code complexity.
 Adding staging/queueing buffers in `FD_BACKUP_ORIG_ACC_DISK_BATCH`
 increased cache pressure (`QUEUE_BUF_SZ_MINIMUM` scale), and benchmarks
 showed reduced compression time (~6%) but no meaningful size win
 (`120 GB` to `118 GB`) and increased latency on a 1 MiB L2 system.
-This direction was discussed with maintainers and shelved after
-benchmarking.
+This direction was shelved after benchmarking.
 See https://github.com/0xfka/firedancer/tree/snapshot_wip for source
 code.
 
@@ -51,5 +49,6 @@ legitimate stream and a slow peer.
 
 Minimum clean L7 traffic to hold all slots is approximately
 `conn_max × 3 MiB/s` per validator (before protocol overhead and
-without a CDN): `384 MiB/s` for 128 connections, or `300,000 MiB/s`
+without relying on external rate limiting, e.g. a CDN): `384 MiB/s`
+for 128 connections, or `300,000 MiB/s`
 (~293 GiB/s, ~2.52 Tb/s) for 100,000 connections.
