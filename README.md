@@ -12,31 +12,18 @@ beating the baseline.
 See [source code](https://github.com/0xfka/firedancer/blob/fd-hash-avx512/src/util/fd_hash.c), [PR 10575](https://github.com/firedancer-io/firedancer/pull/10575), and [PR 10620](https://github.com/firedancer-io/firedancer/pull/10620).
 
 ### **Zstandard frame scanner**
-A helper that finds frame start/size without decompressing, allowing
-snapshot loading pipeline stages to run concurrently. Coverage included
+A helper that finds frame start/size without decompressing, enables
+snapshot loading pipeline to run concurrently. Coverage included
 fuzzing with seeds from [Zstandard sample files by mcraiha](https://github.com/mcraiha/ZSTD-sample-files).
-
-Can be tested with:
-```console
-git clone git@github.com:0xfka/firedancer.git
-cd firedancer
-git checkout frame_wip
-make -j$(nproc) test_zstd
-./build/native/gcc/unit-test/test_zstd
-```
-`test_zstd` is a unit test and should log `pass` on success.
-This branch was superseded due to overlapping work upstream.
 
 ### **Experiments on snapshot-create pipeline**
 Global sorting by owner pubkey (key 1) and mint (key 2) reduced snapshot
 sizes by up to 20%+ versus Firedancer output in tests. This branch
-focused on staging/queueing and did not include sorting, and production
-integration did not meet upstream expectations due to code complexity.
+focused on staging/queueing and did not include sorting. 
 Adding staging/queueing buffers in `FD_BACKUP_ORIG_ACC_DISK_BATCH`
-increased cache pressure (`QUEUE_BUF_SZ_MINIMUM` scale), and benchmarks
+increased cache pressure (`QUEUE_BUF_SZ_MINIMUM` ), and benchmarks
 showed reduced compression time (~6%) but no meaningful size win
 (`120 GB` to `118 GB`) and increased latency on a 1 MiB L2 system.
-This direction was shelved after benchmarking.
 See https://github.com/0xfka/firedancer/tree/snapshot_wip for source
 code.
 
