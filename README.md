@@ -21,7 +21,7 @@ Global sorting by owner pubkey (key 1) and mint (key 2) reduced snapshot
 sizes by up to 20%+ versus Firedancer output in tests. This branch
 focused on staging/queueing and did not include sorting. 
 Adding staging/queueing buffers in `FD_BACKUP_ORIG_ACC_DISK_BATCH`
-increased cache pressure (`QUEUE_BUF_SZ_MINIMUM` ), and benchmarks
+increased cache pressure (`QUEUE_BUF_SZ_MINIMUM`), and benchmarks
 showed reduced compression time (~6%) but no meaningful size win
 (`120 GB` to `118 GB`) and increased latency on a 1 MiB L2 system.
 See https://github.com/0xfka/firedancer/tree/snapshot_wip for source
