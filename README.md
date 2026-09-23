@@ -24,8 +24,7 @@ git checkout frame_wip
 make -j$(nproc) test_zstd
 ./build/native/gcc/unit-test/test_zstd
 ```
-The scanner prints frame starts/sizes and returns `0` on error, or the
-frame count on success.
+`test_zstd` is a unit test and should log `pass` on success.
 This branch was superseded due to overlapping work upstream.
 
 ### **Experiments on snapshot-create pipeline**
